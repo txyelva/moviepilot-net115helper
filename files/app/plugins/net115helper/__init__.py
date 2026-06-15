@@ -24,7 +24,8 @@ from app.chain.media import MediaChain
 from app.db.systemconfig_oper import SystemConfigOper
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas import NotificationType, MediaType
+from app.schemas import Notification, NotificationType, MediaType, TransferInfo
+from app.schemas.types import ContentType
 
 # 115 Web API 请求头
 _115_HEADERS = {
@@ -108,6 +109,7 @@ class Net115Helper(_PluginBase):
     _115_COOLDOWN_SECONDS = 3600
     _FALLBACK_COPY_GUARD_SECONDS = 90 * 60
     _FALLBACK_COPY_SUBMIT_LIMIT_PER_RUN = 1
+    _PRECISION_DIRECT_115_LIMIT_PER_RUN = 1
 
     # ───────── CD2 降级配置 ─────────
     _fallback_enabled: bool = False
@@ -4854,13 +4856,13 @@ function startPolling() {
         logger.info(f"【115助手】{title} 已入库集数: {real_existing_episodes}")
         newly_existing = sorted(real_existing_set - previous_cached_episodes)
         if previous_cached_episodes and newly_existing and self._notify and media_type_str != "电影":
-            ep_text = self._format_episode_preview(newly_existing)
             try:
-                self.post_message(
-                    mtype=NotificationType.Organize,
-                    title=f"115网盘助手 - {title} S{int(season or 1):02d} {ep_text} 已确认入库",
-                    text=f"巡检发现新增入库集数：{ep_text}",
+                self._post_organize_success_template_message(
+                    subscription=sub,
+                    episodes=newly_existing,
+                    reason="巡检确认 115 入库",
                 )
+                ep_text = self._format_episode_preview(newly_existing)
                 logger.info(f"【115助手】{title} 发送新增入库补偿通知: {ep_text}")
             except Exception as e:
                 logger.warning(f"【115助手】{title} 发送新增入库补偿通知失败: {e}")
@@ -5005,30 +5007,57 @@ function startPolling() {
             return
 
         logger.info(f"【115助手】{title} PanSou 搜到 {len(search_results)} 个结果")
+        ranked_search_results = self._rank_episode_results_for_missing(
+            search_results,
+            sub,
+            effective_existing_episodes,
+            target_missing_episodes,
+            log_context=f"{title} 115",
+        )
+        if ranked_search_results:
+            search_results = [item["result"] for item in ranked_search_results]
+        else:
+            search_results = []
+        precise_115_available = any(
+            item.get("missing_hits") for item in ranked_search_results[:20]
+        )
 
         # 115 当前风控敏感：即使搜到了 115 分享，也优先尝试已勾选的备用云盘。
         # 备用云盘一旦提交复制或进入 pending，本轮就不再打开 115 分享详情。
         if self._fallback_enabled and self._fallback_clouds and self._cd2_host:
-            before_fallback_submits = int(getattr(self, "_fallback_copy_submits_this_run", 0) or 0)
-            before_fallback_status = str(sub.get("pending_copy_status") or "")
-            self._try_fallback_cloud_transfer(
-                sub,
-                clean_keyword,
-                expected_year,
-                effective_existing_episodes,
+            direct_used = int(getattr(self, "_direct_115_actions_this_run", 0) or 0)
+            precision_direct_available = (
+                self._batch_check_enabled
+                and self._batch_direct_115_limit <= 0
+                and precise_115_available
+                and direct_used < self._PRECISION_DIRECT_115_LIMIT_PER_RUN
             )
-            after_fallback_submits = int(getattr(self, "_fallback_copy_submits_this_run", 0) or 0)
-            after_fallback_status = str(sub.get("pending_copy_status") or "")
-            if (
-                after_fallback_submits > before_fallback_submits
-                or after_fallback_status != before_fallback_status
-                or self._has_active_fallback_work(sub)
-            ):
+            if precision_direct_available:
                 logger.info(
-                    f"【115助手】{title} 已由备用云盘降级链路接手 "
-                    f"(status={after_fallback_status or 'unknown'})，跳过 115 直连兜底"
+                    f"【115助手】{title} 发现 115 标题精准覆盖缺失集，"
+                    "本轮保留 1 次直连确认机会，备用云盘作为后置兜底"
                 )
-                return
+            else:
+                before_fallback_submits = int(getattr(self, "_fallback_copy_submits_this_run", 0) or 0)
+                before_fallback_status = str(sub.get("pending_copy_status") or "")
+                self._try_fallback_cloud_transfer(
+                    sub,
+                    clean_keyword,
+                    expected_year,
+                    effective_existing_episodes,
+                )
+                after_fallback_submits = int(getattr(self, "_fallback_copy_submits_this_run", 0) or 0)
+                after_fallback_status = str(sub.get("pending_copy_status") or "")
+                if (
+                    after_fallback_submits > before_fallback_submits
+                    or after_fallback_status != before_fallback_status
+                    or self._has_active_fallback_work(sub)
+                ):
+                    logger.info(
+                        f"【115助手】{title} 已由备用云盘降级链路接手 "
+                        f"(status={after_fallback_status or 'unknown'})，跳过 115 直连兜底"
+                    )
+                    return
 
         # 3. 确定目标 CID（区分新/老电影）
         if media_category in ("movie", "movie_archive") and media_type_str == "电影":
@@ -5054,10 +5083,27 @@ function startPolling() {
         # 4. 遍历搜索结果。电影保留较小上限；电视剧常见“一集一个分享”，需要多看一些结果。
         search_result_limit = 5 if media_type_str == "电影" else 20
         search_candidates = search_results[:search_result_limit]
+        effective_direct_115_limit = self._batch_direct_115_limit
         found_episode_nums_this_run = set()
         if self._batch_check_enabled and self._batch_direct_115_limit <= 0:
-            logger.info(f"【115助手】{title} 本批 115 直连重动作上限为 0，跳过 115 分享详情")
-            search_candidates = []
+            precise_candidates = [
+                item["result"] for item in ranked_search_results[:search_result_limit]
+                if item.get("missing_hits")
+            ]
+            if (
+                precise_candidates
+                and int(getattr(self, "_direct_115_actions_this_run", 0) or 0)
+                < self._PRECISION_DIRECT_115_LIMIT_PER_RUN
+            ):
+                search_candidates = precise_candidates[:1]
+                effective_direct_115_limit = self._PRECISION_DIRECT_115_LIMIT_PER_RUN
+                logger.info(
+                    f"【115助手】{title} 本批 115 常规直连上限为 0，"
+                    "但允许打开 1 个精准命中缺集的分享"
+                )
+            else:
+                logger.info(f"【115助手】{title} 本批 115 直连重动作上限为 0，跳过 115 分享详情")
+                search_candidates = []
         for idx, result in enumerate(search_candidates):
             if idx > 0:
                 time.sleep(1)
@@ -5113,10 +5159,10 @@ function startPolling() {
 
                 # 5. 获取分享内容
                 direct_used = int(getattr(self, "_direct_115_actions_this_run", 0) or 0)
-                if self._batch_check_enabled and direct_used >= self._batch_direct_115_limit:
+                if self._batch_check_enabled and direct_used >= effective_direct_115_limit:
                     logger.info(
                         f"【115助手】{title} 本批 115 直连重动作额度已用完 "
-                        f"({direct_used}/{self._batch_direct_115_limit})，停止打开更多 115 分享"
+                        f"({direct_used}/{effective_direct_115_limit})，停止打开更多 115 分享"
                     )
                     break
                 self._direct_115_actions_this_run = direct_used + 1
@@ -5639,14 +5685,268 @@ function startPolling() {
             subscription["_cache_pending_episodes"] = []
             subscription["_cache_pending_since"] = ""
         if newly_existing and self._notify:
-            ep_text = self._format_episode_preview(newly_existing)
-            self.post_message(
-                mtype=NotificationType.Organize,
-                title=f"115网盘助手 - {title} S{int(season):02d} {ep_text} 已确认入库",
-                text=f"待入库重试已完成，新增集数：{ep_text}",
+            self._post_organize_success_template_message(
+                subscription=subscription,
+                episodes=newly_existing,
+                source_files=files,
+                reason="待入库重试确认 115 入库",
             )
         subscription["_cache_updated"] = datetime.now().isoformat()
         return submitted
+
+    @staticmethod
+    def _format_system_season_episode(season: Optional[int], episodes: List[int]) -> str:
+        """按 MP 原生通知习惯格式化季集，例如 S01 E15 / S01 E18-E20。"""
+        try:
+            season_num = int(season or 1)
+        except (TypeError, ValueError):
+            season_num = 1
+        prefix = f"S{season_num:02d}"
+        cleaned = sorted({int(ep) for ep in episodes if ep is not None})
+        if not cleaned:
+            return prefix
+        if len(cleaned) == 1:
+            ep_part = f"E{cleaned[0]:02d}"
+        elif cleaned == list(range(cleaned[0], cleaned[-1] + 1)):
+            ep_part = f"E{cleaned[0]:02d}-E{cleaned[-1]:02d}"
+        else:
+            ep_part = ",".join(f"E{ep:02d}" for ep in cleaned)
+        return f"{prefix} {ep_part}"
+
+    def _collect_notice_files_from_history(
+        self,
+        tmdb_id: Optional[int],
+        media_type_str: str,
+        season: Optional[int],
+        episodes: List[int],
+    ) -> List[dict]:
+        """从 MP 整理历史取刚确认入库的文件信息，用于补齐系统通知里的大小。"""
+        if not tmdb_id or media_type_str == "电影" or not episodes:
+            return []
+        try:
+            from app.db.transferhistory_oper import TransferHistoryOper
+        except Exception as e:
+            logger.debug(f"【115助手】导入整理历史失败，跳过通知文件补全: {e}")
+            return []
+
+        wanted = {int(ep) for ep in episodes if ep is not None}
+        try:
+            target_season = int(season or 1)
+            histories = TransferHistoryOper().get_by(
+                mtype=media_type_str,
+                tmdbid=int(tmdb_id),
+                season=f"S{target_season:02d}",
+            ) or []
+        except Exception as e:
+            logger.debug(f"【115助手】读取整理历史失败，跳过通知文件补全: {e}")
+            return []
+
+        matched_by_episode: Dict[int, dict] = {}
+        for history in histories:
+            try:
+                if not getattr(history, "status", False):
+                    continue
+                episode_text = str(getattr(history, "episodes", "") or "").upper()
+                if not episode_text:
+                    episode_text = str(getattr(history, "dest", "") or "").upper()
+
+                history_eps = set()
+                for start, end in re.findall(r"E?(\d{1,3})\s*-\s*E?(\d{1,3})", episode_text):
+                    start_num, end_num = int(start), int(end)
+                    if start_num <= end_num:
+                        history_eps.update(range(start_num, end_num + 1))
+                for ep in re.findall(r"E(\d{1,3})", episode_text):
+                    history_eps.add(int(ep))
+                hit_eps = sorted(history_eps & wanted)
+                if not hit_eps:
+                    continue
+
+                data = history.to_dict() if hasattr(history, "to_dict") else {}
+                fileitem = data.get("dest_fileitem") or data.get("src_fileitem") or {}
+                path = data.get("dest") or data.get("src") or fileitem.get("path") or ""
+                name = fileitem.get("name") or Path(path).name
+                item = {
+                    "name": name,
+                    "path": path,
+                    "size": int(fileitem.get("size", 0) or 0),
+                    "episodes": hit_eps,
+                    "date": str(data.get("date") or ""),
+                }
+                for ep in hit_eps:
+                    old = matched_by_episode.get(ep)
+                    if not old or item["date"] >= old.get("date", ""):
+                        matched_by_episode[ep] = item
+            except Exception:
+                continue
+
+        seen = set()
+        result = []
+        for ep in sorted(matched_by_episode):
+            item = matched_by_episode[ep]
+            key = item.get("path") or item.get("name") or str(ep)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
+        return result
+
+    def _summarize_notice_files(
+        self,
+        episodes: List[int],
+        source_files: Optional[List[dict]] = None,
+    ) -> Tuple[int, int, str]:
+        """提取通知需要的文件数、总大小和用于解析质量的样例文件名。"""
+        cleaned_eps = {int(ep) for ep in episodes if ep is not None}
+        source_files = source_files or []
+        matched = []
+        for item in source_files:
+            name = str(item.get("name") or Path(str(item.get("path") or "")).name)
+            path = str(item.get("path") or name)
+            ep_num = self._parse_episode_number(name) or self._parse_episode_number(path)
+            if cleaned_eps and ep_num not in cleaned_eps:
+                continue
+            matched.append(item)
+
+        if not matched:
+            matched = source_files
+
+        file_count = len(matched) if matched else max(len(cleaned_eps), 1)
+        total_size = 0
+        sample_name = ""
+        for item in matched:
+            try:
+                total_size += int(item.get("size", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+            if not sample_name:
+                sample_name = str(item.get("name") or Path(str(item.get("path") or "")).name)
+        return file_count, total_size, sample_name
+
+    def _build_notification_media_context(
+        self,
+        subscription: dict,
+        episodes: List[int],
+        sample_name: str = "",
+    ) -> Tuple[Optional[ParseMeta], Any]:
+        """识别媒体并构造给 MP 消息模板使用的 meta/mediainfo。"""
+        title = str(subscription.get("title") or "").strip()
+        media_type_str = subscription.get("media_type", "电视剧")
+        season = subscription.get("season")
+        year = subscription.get("year")
+        first_ep = sorted(episodes)[0] if episodes else None
+        season_ep = ""
+        if media_type_str != "电影" and first_ep:
+            try:
+                season_ep = f"S{int(season or 1):02d}E{int(first_ep):02d}"
+            except (TypeError, ValueError):
+                season_ep = f"E{int(first_ep):02d}"
+
+        candidates = []
+        if sample_name:
+            candidates.append(Path(sample_name).stem)
+        title_candidate = " ".join(
+            part for part in (title, f"({year})" if year else "", season_ep) if part
+        ).strip()
+        if title_candidate:
+            candidates.append(title_candidate)
+        if title:
+            candidates.append(title)
+
+        expected_tmdb = None
+        try:
+            expected_tmdb = int(subscription.get("tmdb_id") or 0) or None
+        except (TypeError, ValueError):
+            expected_tmdb = None
+
+        fallback_meta = None
+        fallback_media = None
+        media_chain = MediaChain()
+        for candidate in dict.fromkeys(candidates):
+            try:
+                meta = ParseMeta(candidate)
+                if season:
+                    meta.begin_season = int(season)
+                if first_ep:
+                    meta.begin_episode = int(first_ep)
+                meta.type = MediaType.MOVIE if media_type_str == "电影" else MediaType.TV
+                mediainfo = media_chain.recognize_by_meta(meta, obtain_images=True)
+                if not fallback_meta:
+                    fallback_meta = meta
+                    fallback_media = mediainfo
+                if not mediainfo:
+                    continue
+                actual_tmdb = getattr(mediainfo, "tmdb_id", None)
+                try:
+                    actual_tmdb = int(actual_tmdb) if actual_tmdb not in (None, "") else None
+                except (TypeError, ValueError):
+                    actual_tmdb = None
+                if not expected_tmdb or actual_tmdb == expected_tmdb:
+                    return meta, mediainfo
+            except Exception as e:
+                logger.debug(f"【115助手】构造入库通知媒体上下文失败: {candidate} | {e}")
+                continue
+        return fallback_meta, fallback_media
+
+    def _post_organize_success_template_message(
+        self,
+        subscription: dict,
+        episodes: List[int],
+        source_files: Optional[List[dict]] = None,
+        reason: str = "",
+    ) -> None:
+        """使用 MP 原生“整理入库成功”模板发送 115 入库确认通知。"""
+        cleaned = sorted({int(ep) for ep in episodes if ep is not None})
+        if not cleaned:
+            return
+
+        title = subscription.get("title", "")
+        tmdb_id = subscription.get("tmdb_id")
+        media_type_str = subscription.get("media_type", "电视剧")
+        season = subscription.get("season")
+
+        notice_files = self._collect_notice_files_from_history(
+            tmdb_id=tmdb_id,
+            media_type_str=media_type_str,
+            season=season,
+            episodes=cleaned,
+        )
+        if not notice_files:
+            notice_files = source_files or []
+
+        file_count, total_size, sample_name = self._summarize_notice_files(cleaned, notice_files)
+        meta, mediainfo = self._build_notification_media_context(subscription, cleaned, sample_name)
+        season_episode = self._format_system_season_episode(season, cleaned)
+
+        if not mediainfo:
+            ep_text = self._format_episode_preview(cleaned)
+            self.post_message(
+                mtype=NotificationType.Organize,
+                title=f"{title} {season_episode} 已入库",
+                text=f"{reason or '115入库确认'}，新增集数：{ep_text}",
+            )
+            return
+
+        transferinfo = TransferInfo(
+            file_count=file_count,
+            total_size=total_size,
+        )
+        self.chain.post_message(
+            Notification(
+                mtype=NotificationType.Organize,
+                ctype=ContentType.OrganizeSuccess,
+                image=mediainfo.get_message_image(),
+                link=settings.MP_DOMAIN("#/history"),
+            ),
+            meta=meta,
+            mediainfo=mediainfo,
+            transferinfo=transferinfo,
+            season_episode=season_episode,
+            source="115入库",
+        )
+        logger.info(
+            f"【115助手】{title} 已按 MP 入库模板发送 115 入库确认通知: "
+            f"{season_episode}, files={file_count}, size={total_size}"
+        )
 
     def _notify_token_expired(self, source: str, detail: str = "") -> None:
         """
@@ -5705,6 +6005,198 @@ function startPolling() {
                 if m2:
                     return int(m2.group(1))
         return None
+
+    def _rank_episode_results_for_missing(
+        self,
+        results: List[dict],
+        subscription: dict,
+        existing_episodes: Optional[List[int]] = None,
+        target_missing_episodes: Optional[List[int]] = None,
+        log_context: str = "",
+    ) -> List[dict]:
+        """
+        按“标题是否明确覆盖缺失集”排序搜索结果。
+
+        标题提示只用于决定优先级和是否值得打开分享；最终仍以后续真实文件列表
+        解析为准，避免只靠标题误转。
+        """
+        if not results:
+            return []
+
+        if subscription.get("media_type", "电视剧") == "电影":
+            return [
+                {
+                    "result": result,
+                    "score": 0,
+                    "hints": [],
+                    "missing_hits": [],
+                    "unknown": True,
+                }
+                for result in results
+            ]
+
+        existing_set = set()
+        for ep in existing_episodes or []:
+            try:
+                existing_set.add(int(ep))
+            except (TypeError, ValueError):
+                continue
+
+        missing_set = set()
+        for ep in target_missing_episodes or []:
+            try:
+                missing_set.add(int(ep))
+            except (TypeError, ValueError):
+                continue
+        if not missing_set:
+            try:
+                total_eps = int(subscription.get("_cache_total_episodes") or 0)
+            except (TypeError, ValueError):
+                total_eps = 0
+            if total_eps > 0:
+                missing_set = set(range(1, total_eps + 1)) - existing_set
+
+        ranked = []
+        skipped_existing_only = 0
+        skipped_off_topic = 0
+        total_eps_for_hints = subscription.get("_cache_total_episodes")
+        target_season = subscription.get("season")
+
+        for index, result in enumerate(results):
+            if self._result_definitely_off_topic(result, subscription):
+                skipped_off_topic += 1
+                continue
+
+            text = " ".join(
+                str(result.get(key, "") or "")
+                for key in ("note", "name", "title", "url")
+            )
+            hints = self._extract_episode_hints_from_text(
+                text,
+                total_episodes=total_eps_for_hints,
+                target_season=target_season,
+            )
+            hint_set = set(hints)
+            if missing_set:
+                missing_hits = sorted(hint_set & missing_set)
+            else:
+                missing_hits = sorted(hint_set - existing_set)
+
+            # 明确只覆盖已有集数的标题不值得打开；未知标题保留低优先级兜底。
+            if hint_set and not missing_hits:
+                skipped_existing_only += 1
+                continue
+
+            if missing_hits:
+                score = len(missing_hits) * 1000
+                if missing_set and missing_set.issubset(hint_set):
+                    score += 500
+                if missing_set and min(missing_set) in missing_hits:
+                    score += 250
+                # 同样命中缺失时，优先范围更窄的候选，例如 E18-E20 优于全 40 集。
+                score -= min(len(hint_set), 120)
+            else:
+                score = -100
+
+            ranked.append({
+                "result": result,
+                "score": score,
+                "hints": sorted(hint_set),
+                "missing_hits": missing_hits,
+                "unknown": not bool(hint_set),
+                "original_index": index,
+            })
+
+        ranked.sort(
+            key=lambda item: (
+                item["score"],
+                len(item["missing_hits"]),
+                -len(item["hints"]) if item["hints"] else -999,
+                -item["original_index"],
+            ),
+            reverse=True,
+        )
+
+        if log_context:
+            if ranked:
+                preview = []
+                for item in ranked[:5]:
+                    note = str(item["result"].get("note", item["result"].get("url", "")))[:40]
+                    hits = self._format_episode_preview(item["missing_hits"])
+                    hints = self._format_episode_preview(item["hints"])
+                    label = f"hit={hits}" if item["missing_hits"] else "unknown"
+                    preview.append(f"{label}, hints={hints}, note={note}")
+                logger.info(
+                    f"【115助手】{log_context} 精准候选排序: "
+                    f"{' | '.join(preview)}"
+                    + (
+                        f"，跳过仅含已有集数 {skipped_existing_only} 个"
+                        if skipped_existing_only else ""
+                    )
+                    + (
+                        f"，排除疑似无关结果 {skipped_off_topic} 个"
+                        if skipped_off_topic else ""
+                    )
+                )
+            elif skipped_existing_only or skipped_off_topic:
+                logger.info(
+                    f"【115助手】{log_context} 搜索结果均不适合打开，"
+                    f"跳过已有集数 {skipped_existing_only} 个，"
+                    f"排除无关结果 {skipped_off_topic} 个"
+                )
+
+        return ranked
+
+    @staticmethod
+    def _result_definitely_off_topic(result: dict, subscription: dict) -> bool:
+        """过滤标题党、在线观影页、课程等明显不是目标剧资源的搜索结果。"""
+        title = str(subscription.get("title") or "").strip()
+        if not title:
+            return False
+
+        text = " ".join(
+            str(result.get(key, "") or "")
+            for key in ("note", "name", "title", "url")
+        )
+        compact = re.sub(r"\s+", "", text)
+        title_compact = re.sub(r"\s+", "", title)
+        if title_compact and title_compact not in compact:
+            return True
+
+        # 这些通常是在线播放/课程营销页，不是可转存的网盘剧集文件。
+        noise_tokens = (
+            "在线观看", "免费在线观看", "无广告在线", "超清免费在线观看",
+            "vs影视", "口语", "英语", "课程", "亲授", "老师", "电台",
+            "社交", "旅行", "达人", "教学理念",
+        )
+        compact_lower = compact.lower()
+        if any(token in compact_lower for token in noise_tokens):
+            return True
+
+        # 短中文标题容易作为普通词出现，例如“行业翘楚”。要求它出现在剧名语境里。
+        chinese_only_title = re.sub(r"[^\u4e00-\u9fff]", "", title_compact)
+        if 0 < len(chinese_only_title) <= 3:
+            strong_contexts = (
+                f"《{title_compact}》",
+                f"{title_compact}(",
+                f"{title_compact}（",
+                f"{title_compact}[",
+                f"{title_compact}【",
+                f"{title_compact}/",
+                f"/{title_compact}",
+                f"🗄{title_compact}",
+                f"剧集🗄{title_compact}",
+            )
+            episode_context = re.search(
+                rf"{re.escape(title_compact)}(?:[sS]\d{{1,2}}[eE]?\d{{0,3}}|[eE]\d{{1,3}}|"
+                rf"第?\d{{1,3}}[集话話]|(?:更新至|更新到|更新|更至|更)\d{{1,3}}[集话話]|"
+                rf"全\d{{1,3}}[集话話]|全集|完结|已完结)",
+                compact,
+            )
+            if not any(token in compact for token in strong_contexts) and not episode_context:
+                return True
+
+        return False
 
     @staticmethod
     def _add_episode_span(episodes: set, start: int, end: Optional[int] = None,
@@ -5807,7 +6299,7 @@ function startPolling() {
                 continue
 
         # 更新至44集 / 更新到44集 / 更至44集 / 至44集：可信表达为 1..44。
-        for ep_s in re.findall(r'(?:更新至|更新到|更新|更至|连载至|连载|至)\s*0?(\d{1,3})\s*[集话話]', raw):
+        for ep_s in re.findall(r'(?:更新至|更新到|更新|更至|更|连载至|连载|至)\s*0?(\d{1,3})\s*[集话話]', raw):
             try:
                 cls._add_episode_span(episodes, 1, int(ep_s), max_episode=max_episode)
             except (TypeError, ValueError):
@@ -6271,6 +6763,12 @@ function startPolling() {
 
         fallback_clouds = list(self._fallback_clouds or [])
         target_status_cache = {}
+        fallback_fail_reasons = []
+
+        def _remember_fallback_reason(reason: str) -> None:
+            if reason and len(fallback_fail_reasons) < 12:
+                fallback_fail_reasons.append(reason)
+
         # 按用户勾选的备用云盘逐个搜索；批次额度只限制最终提交到 115 的复制任务数，
         # 不能截断云盘列表，否则第一个盘无结果时会误判“所有备用云盘均未找到”。
         for cloud_name in fallback_clouds:
@@ -6279,11 +6777,28 @@ function startPolling() {
             )
             if not results:
                 logger.info(f"【115助手】[降级] {cloud_name} 未搜到 {title} 的资源")
+                _remember_fallback_reason(f"{cloud_name}: 未搜到资源")
+                continue
+
+            ranked_results = self._rank_episode_results_for_missing(
+                results,
+                subscription,
+                existing_episodes,
+                log_context=f"[降级] {title}/{cloud_name}",
+            )
+            if ranked_results:
+                results = [item["result"] for item in ranked_results]
+            else:
+                logger.info(
+                    f"【115助手】[降级] {cloud_name} 搜索结果均未覆盖 {title} 当前缺失集数"
+                )
+                _remember_fallback_reason(f"{cloud_name}: 结果未覆盖缺失集")
                 continue
 
             staging_root = self._get_fallback_staging_path(cloud_name).rstrip("/")
             if not staging_root:
                 logger.info(f"【115助手】[降级] {cloud_name} 未配置临时目录，跳过")
+                _remember_fallback_reason(f"{cloud_name}: 未配置临时目录")
                 continue
 
             is_aliyun = "阿里" in cloud_name
@@ -6310,12 +6825,14 @@ function startPolling() {
 
             if cloud_client is None or not cloud_client.is_available():
                 logger.warning(f"【115助手】[降级] {cloud_name} 客户端不可用，跳过")
+                _remember_fallback_reason(f"{cloud_name}: 客户端不可用")
                 continue
 
             if not cloud_client.is_logged_in():
                 logger.warning(
                     f"【115助手】[降级] {cloud_name} 未登录，请先在插件登录中心/设置中完成登录"
                 )
+                _remember_fallback_reason(f"{cloud_name}: 未登录")
                 continue
 
             # 最多尝试 3 个结果
@@ -6693,6 +7210,7 @@ function startPolling() {
                             logger.warning(
                                 f"【115助手】[降级] {cloud_name}转存{reason}: {share_url[:60]}"
                             )
+                            _remember_fallback_reason(f"{cloud_name}: 分享保存{reason}")
                             continue
 
                     # 3. 轮询等待文件就绪（云盘服务端复制是异步的）
@@ -6731,6 +7249,7 @@ function startPolling() {
                         logger.warning(
                             f"【115助手】[降级] {cloud_name}文件等待超时 ({_FILE_WAIT_MAX}s): {cd2_staging}"
                         )
+                        _remember_fallback_reason(f"{cloud_name}: 文件等待超时")
                         continue
 
                     # 4. 确定复制源和目标
@@ -6766,6 +7285,7 @@ function startPolling() {
                     if not copy_items:
                         _sys.stdout.write("【降级】没有匹配目标季的文件，跳过该资源\n")
                         _sys.stdout.flush()
+                        _remember_fallback_reason(f"{cloud_name}: 没有匹配目标季文件")
                         continue
 
                     import re as _re_ep
@@ -6819,6 +7339,7 @@ function startPolling() {
                     if not copy_items:
                         _sys.stdout.write("【降级】展开后没有可复制文件，跳过该资源\n")
                         _sys.stdout.flush()
+                        _remember_fallback_reason(f"{cloud_name}: 展开后无可复制文件")
                         continue
 
                     # 4b. 按缺失集数过滤：库里已有 + 115目标目录已有 + pending 都不再复制
@@ -6872,6 +7393,7 @@ function startPolling() {
                             cloud_client,
                             cloud_api_staging,
                         )
+                        _remember_fallback_reason(f"{cloud_name}: 文件均已存在")
                         continue
 
                     # 4c. 统一规范化剧集文件名，确保 MP 看到的是「剧名.SxxEyy」。
@@ -6955,6 +7477,7 @@ function startPolling() {
                     if not copy_items:
                         _sys.stdout.write("【降级】没有命名安全的文件可复制，跳过该资源\n")
                         _sys.stdout.flush()
+                        _remember_fallback_reason(f"{cloud_name}: 无命名安全文件")
                         continue
 
                     src_paths = [item["path"] for item in copy_items]
@@ -6978,6 +7501,7 @@ function startPolling() {
                     if not _ensure_cd2_dir(copy_target):
                         _sys.stdout.write(f"【降级】目标目录无法创建，跳过复制: {copy_target}\n")
                         _sys.stdout.flush()
+                        _remember_fallback_reason(f"{cloud_name}: 目标目录无法创建")
                         continue
 
                     # 6. CD2 复制到 115
@@ -7032,6 +7556,7 @@ function startPolling() {
                             cloud_client,
                             cloud_api_staging,
                         )
+                        _remember_fallback_reason(f"{cloud_name}: CD2复制提交失败")
                         continue
                     self._fallback_copy_submits_this_run = submitted_count + 1
 
@@ -7137,8 +7662,15 @@ function startPolling() {
                 except Exception as e:
                     _sys.stdout.write(f"【降级】转存异常: {e}\n"); _sys.stdout.flush()
                     logger.error(f"【115助手】[降级] 转存异常: {e}", exc_info=True)
+                    _remember_fallback_reason(f"{cloud_name}: 转存异常 {e}")
 
-        logger.info(f"【115助手】[降级] {title} 在所有备用云盘均未找到可用资源")
+        if fallback_fail_reasons:
+            logger.info(
+                f"【115助手】[降级] {title} 未能提交备用云盘转存，原因: "
+                f"{'; '.join(fallback_fail_reasons)}"
+            )
+        else:
+            logger.info(f"【115助手】[降级] {title} 在所有备用云盘均未找到可用资源")
 
     def _cleanup_fallback_staging(self, cd2, cd2_items, cloud_client=None, cloud_api_staging: str = ""):
         """清理备用云盘临时子目录；CD2 删除后再通过插件客户端做双保险。"""
