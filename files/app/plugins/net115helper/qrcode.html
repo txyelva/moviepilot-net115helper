@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>115 扫码登录</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #121212; color: #fff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+  .card { background: #1e1e1e; border-radius: 12px; padding: 32px; max-width: 360px; width: 100%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.5); }
+  h2 { margin: 0 0 8px 0; font-size: 20px; }
+  .subtitle { color: #888; font-size: 13px; margin-bottom: 24px; }
+  .qr-container { margin: 16px auto; min-height: 200px; display: flex; justify-content: center; align-items: center; }
+  .qr-img { max-width: 200px; max-height: 200px; border-radius: 8px; display: none; }
+  .qr-placeholder { color: #555; font-size: 14px; padding: 60px 0; }
+  .status { font-size: 14px; margin: 16px 0; min-height: 24px; }
+  .status.waiting { color: #aaa; }
+  .status.scanned { color: #2196f3; }
+  .status.confirmed { color: #4caf50; }
+  .status.expired { color: #ff9800; }
+  .status.invalid { color: #ff9800; }
+  .status.error { color: #f44336; }
+  .instructions { background: #2a2a2a; border-radius: 8px; padding: 12px 16px; text-align: left; font-size: 13px; color: #aaa; margin-bottom: 16px; line-height: 1.6; }
+  .instructions strong { color: #fff; }
+  .btn { background: #2196f3; color: #fff; border: none; border-radius: 8px; padding: 12px 24px; font-size: 15px; cursor: pointer; width: 100%; transition: background 0.2s; }
+  .btn:hover { background: #1976d2; }
+  .btn:disabled { background: #444; color: #888; cursor: not-allowed; }
+  .spinner { display: none; width: 24px; height: 24px; border: 3px solid #333; border-top-color: #2196f3; border-radius: 50%; animation: spin 1s linear infinite; margin: 16px auto; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .success-icon { display: none; color: #4caf50; font-size: 48px; margin: 16px 0; }
+  .footer { margin-top: 16px; font-size: 12px; color: #555; }
+  .debug { font-size: 11px; color: #666; text-align: left; word-break: break-all; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>115 网盘扫码登录</h2>
+  <p class="subtitle">使用 115 手机 APP 扫码确认登录</p>
+
+  <div class="instructions">
+    <strong>操作步骤：</strong><br>
+    1. 点击「生成二维码」按钮<br>
+    2. 打开 115 手机 APP<br>
+    3. 扫描屏幕上二维码<br>
+    4. 在手机上点击「确认登录」
+  </div>
+
+  <div class="qr-container">
+    <div class="qr-placeholder" id="placeholder">点击下方按钮生成二维码</div>
+    <img class="qr-img" id="qrcode" alt="二维码">
+  </div>
+
+  <div class="spinner" id="spinner"></div>
+  <div class="status" id="status"></div>
+  <div class="debug" id="debug"></div>
+
+  <button class="btn" id="generateBtn" onclick="generateQR()">生成二维码</button>
+
+  <div class="success-icon" id="successIcon">&#10003;</div>
+
+  <p class="footer">Cookie 自动保存，登录状态长期有效</p>
+</div>
+
+<script>
+function getToken() {
+  // 优先从 URL 参数读取（插件详情页传递）
+  var params = new URLSearchParams(window.location.search);
+  var urlToken = params.get('token');
+  if (urlToken) return urlToken;
+
+  // 回退到 localStorage
+  var keys = ['token', 'access_token', 'accessToken'];
+  for (var i = 0; i < keys.length; i++) {
+    var val = localStorage.getItem(keys[i]);
+    if (val) return val;
+  }
+  return '';
+}
+
+function setStatus(msg, cls) {
+  var el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = 'status ' + (cls || '');
+}
+
+function setDebug(msg) {
+  var el = document.getElementById('debug');
+  el.textContent = msg;
+}
+
+function generateQR() {
+  var btn = document.getElementById('generateBtn');
+  var spinner = document.getElementById('spinner');
+  var placeholder = document.getElementById('placeholder');
+  var qrcode = document.getElementById('qrcode');
+
+  btn.disabled = true;
+  btn.textContent = '生成中...';
+  spinner.style.display = 'block';
+  setStatus('正在生成二维码...', 'waiting');
+
+  var token = getToken();
+  setDebug('Token: ' + (token ? token.substring(0, 15) + '...' : 'NONE'));
+
+  var headers = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+
+  fetch('/api/v1/plugin/Net115Helper/qrcode_login', {
+    method: 'POST',
+    headers: headers,
+    credentials: 'include'
+  })
+  .then(function(r) {
+    setDebug('HTTP ' + r.status + ' ' + r.statusText);
+    return r.json();
+  })
+  .then(function(data) {
+    setDebug('Response: ' + JSON.stringify(data).substring(0, 200));
+    spinner.style.display = 'none';
+    btn.textContent = '生成二维码';
+    btn.disabled = false;
+
+    if (!data.success) {
+      var errMsg = data.message || data.detail || '未知错误';
+      setStatus('生成失败: ' + errMsg, 'error');
+      return;
+    }
+
+    placeholder.style.display = 'none';
+    qrcode.style.display = 'block';
+    qrcode.src = data.qrcode_base64;
+    setStatus('请用 115 手机 APP 扫码', 'waiting');
+    startPolling();
+  })
+  .catch(function(err) {
+    spinner.style.display = 'none';
+    btn.disabled = false;
+    btn.textContent = '生成二维码';
+    setStatus('网络错误: ' + err.message, 'error');
+    setDebug('Error: ' + err.message);
+  });
+}
+
+var pollInterval = null;
+
+function startPolling() {
+  if (pollInterval) clearInterval(pollInterval);
+  var token = getToken();
+  var headers = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+
+  pollInterval = setInterval(function() {
+    fetch('/api/v1/plugin/Net115Helper/qrcode_status', {
+      headers: headers,
+      credentials: 'include'
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var status = data.status || 'idle';
+      var msg = data.message || '';
+      setStatus(msg, status);
+
+      if (status === 'confirmed') {
+        clearInterval(pollInterval);
+        document.getElementById('qrcode').style.display = 'none';
+        document.getElementById('successIcon').style.display = 'block';
+        document.getElementById('generateBtn').style.display = 'none';
+        setStatus('登录成功！Cookie 已保存', 'confirmed');
+      } else if (status === 'expired') {
+        clearInterval(pollInterval);
+        setStatus('二维码已过期，请重新生成', 'expired');
+        document.getElementById('generateBtn').disabled = false;
+      } else if (status === 'error') {
+        clearInterval(pollInterval);
+        setStatus('错误: ' + msg, 'error');
+      } else if (status === 'scanned') {
+        setStatus('已扫码，请在手机确认...', 'scanned');
+      }
+    })
+    .catch(function(err) { setDebug('轮询错误: ' + err.message); });
+  }, 2000);
+}
+
+window.addEventListener('load', function() {
+  var token = getToken();
+  var headers = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  fetch('/api/v1/plugin/Net115Helper/login_status', {
+    headers: headers,
+    credentials: 'include'
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    if (data.logged_in) {
+      document.getElementById('generateBtn').textContent = '已登录';
+      document.getElementById('generateBtn').disabled = true;
+      document.getElementById('placeholder').textContent = 'Cookie 已配置，无需重新登录';
+    } else if (data.cookie_file_exists || data.message) {
+      setStatus(data.message || '当前 Cookie 不可用，可重新扫码', 'invalid');
+      document.getElementById('placeholder').textContent = '当前 Cookie 不可用，请重新生成二维码';
+    }
+  })
+  .catch(function() {});
+});
+</script>
+</body>
+</html>

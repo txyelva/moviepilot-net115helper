@@ -1,0 +1,40 @@
+.DS_Store
+**/.DS_Store
+
+# Local assistant/tooling state. May contain private commands, hosts, tokens, or passwords.
+.claude/
+
+# Python/runtime caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local virtual environments
+.venv/
+venv/
+env/
+
+# Build/deploy artifacts
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+dist/
+build/
+
+# MoviePilot / plugin runtime secrets and local sessions
+.p115_cookies
+qrcode_115.png
+.aligo/
+config/
+logs/
+*.log
+
+# Editor state
+.idea/
+.vscode/
+*.swp
+*.swo

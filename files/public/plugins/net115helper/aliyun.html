@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>阿里云盘扫码登录</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #121212; color: #fff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+  .card { background: #1e1e1e; border-radius: 12px; padding: 32px; max-width: 360px; width: 100%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.5); }
+  h2 { margin: 0 0 8px 0; font-size: 20px; }
+  .subtitle { color: #888; font-size: 13px; margin-bottom: 24px; }
+  .qr-container { margin: 16px auto; min-height: 200px; display: flex; justify-content: center; align-items: center; }
+  .qr-img { max-width: 200px; max-height: 200px; border-radius: 8px; display: none; }
+  .qr-placeholder { color: #555; font-size: 14px; padding: 60px 0; }
+  .status { font-size: 14px; margin: 16px 0; min-height: 24px; }
+  .status.waiting { color: #aaa; }
+  .status.confirmed { color: #4caf50; }
+  .status.error { color: #f44336; }
+  .instructions { background: #2a2a2a; border-radius: 8px; padding: 12px 16px; text-align: left; font-size: 13px; color: #aaa; margin-bottom: 16px; line-height: 1.6; }
+  .instructions strong { color: #fff; }
+  .btn { background: #ff6a00; color: #fff; border: none; border-radius: 8px; padding: 12px 24px; font-size: 15px; cursor: pointer; width: 100%; transition: background 0.2s; }
+  .btn:hover { background: #e55a00; }
+  .btn:disabled { background: #444; color: #888; cursor: not-allowed; }
+  .spinner { display: none; width: 24px; height: 24px; border: 3px solid #333; border-top-color: #ff6a00; border-radius: 50%; animation: spin 1s linear infinite; margin: 16px auto; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .success-icon { display: none; color: #4caf50; font-size: 48px; margin: 16px 0; }
+  .footer { margin-top: 16px; font-size: 12px; color: #555; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>阿里云盘扫码登录</h2>
+  <p class="subtitle">使用阿里云盘手机 APP 扫码授权</p>
+
+  <div class="instructions">
+    <strong>操作步骤：</strong><br>
+    1. 点击「生成二维码」按钮<br>
+    2. 打开阿里云盘手机 APP<br>
+    3. 扫描屏幕上的二维码<br>
+    4. 在手机上点击「确认登录」
+  </div>
+
+  <div class="qr-container">
+    <div class="qr-placeholder" id="placeholder">点击下方按钮生成二维码</div>
+    <img class="qr-img" id="qrcode" alt="二维码">
+  </div>
+
+  <div class="spinner" id="spinner"></div>
+  <div class="status" id="status"></div>
+
+  <button class="btn" id="generateBtn" onclick="generateQR()">生成二维码</button>
+  <div class="success-icon" id="successIcon">&#10003;</div>
+
+  <p class="footer">登录状态长期有效，token 保存在服务器</p>
+</div>
+
+<script>
+function getToken() {
+  var params = new URLSearchParams(window.location.search);
+  var t = params.get('token');
+  if (t) return t;
+  var keys = ['token', 'access_token', 'accessToken'];
+  for (var i = 0; i < keys.length; i++) {
+    var v = localStorage.getItem(keys[i]);
+    if (v) return v;
+  }
+  return '';
+}
+
+function setStatus(msg, cls) {
+  var el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = 'status ' + (cls || '');
+}
+
+function generateQR() {
+  var btn = document.getElementById('generateBtn');
+  var spinner = document.getElementById('spinner');
+  var placeholder = document.getElementById('placeholder');
+  var qrcode = document.getElementById('qrcode');
+
+  btn.disabled = true;
+  btn.textContent = '生成中...';
+  spinner.style.display = 'block';
+  setStatus('正在生成二维码...', 'waiting');
+
+  var token = getToken();
+  var headers = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+
+  fetch('/api/v1/plugin/Net115Helper/aliyun_qrcode_login', {
+    method: 'POST',
+    headers: headers,
+    credentials: 'include'
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    spinner.style.display = 'none';
+    btn.textContent = '生成二维码';
+    btn.disabled = false;
+
+    if (!data.success) {
+      setStatus('生成失败: ' + (data.message || '未知错误'), 'error');
+      return;
+    }
+
+    placeholder.style.display = 'none';
+    qrcode.style.display = 'block';
+    qrcode.src = data.qrcode_base64;
+    setStatus('请用阿里云盘 APP 扫码', 'waiting');
+    startPolling();
+  })
+  .catch(function(err) {
+    spinner.style.display = 'none';
+    btn.disabled = false;
+    btn.textContent = '生成二维码';
+    setStatus('网络错误: ' + err.message, 'error');
+  });
+}
+
+var pollInterval = null;
+
+function startPolling() {
+  if (pollInterval) clearInterval(pollInterval);
+  var token = getToken();
+  var headers = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+
+  pollInterval = setInterval(function() {
+    fetch('/api/v1/plugin/Net115Helper/aliyun_qrcode_status', {
+      headers: headers,
+      credentials: 'include'
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var status = data.status || 'idle';
+      if (status === 'confirmed') {
+        clearInterval(pollInterval);
+        document.getElementById('qrcode').style.display = 'none';
+        document.getElementById('successIcon').style.display = 'block';
+        document.getElementById('generateBtn').style.display = 'none';
+        setStatus('登录成功！', 'confirmed');
+      } else if (status === 'error') {
+        clearInterval(pollInterval);
+        setStatus('错误: ' + (data.message || ''), 'error');
+        document.getElementById('generateBtn').disabled = false;
+      } else if (status === 'waiting') {
+        setStatus('请用阿里云盘 APP 扫码...', 'waiting');
+      }
+    })
+    .catch(function() {});
+  }, 2000);
+}
+
+window.addEventListener('load', function() {
+  var token = getToken();
+  var headers = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+
+  fetch('/api/v1/plugin/Net115Helper/aliyun_login_status', {
+    headers: headers,
+    credentials: 'include'
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    if (data.logged_in) {
+      document.getElementById('generateBtn').textContent = '重新登录';
+      document.getElementById('placeholder').textContent = '已登录，无需重新扫码';
+      setStatus('已登录', 'confirmed');
+    }
+  })
+  .catch(function() {});
+});
+</script>
+</body>
+</html>
