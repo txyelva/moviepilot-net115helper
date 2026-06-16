@@ -7,11 +7,12 @@
 import json
 import os
 import re
+import sqlite3
 import time
 import threading as _threading_mod
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import Body
@@ -146,6 +147,7 @@ class Net115Helper(_PluginBase):
     # ───────── CD2 巡查同步配置 ─────────
     _cd2_watch_enabled: bool = False
     _cd2_watch_rules: List[dict] = []   # [{id, enabled, name, source_path, dest_115_path}]
+    _CD2_WATCH_NOTICE_TTL_SECONDS = 24 * 3600
 
     # ================================================================
     #  初始化 / 状态
@@ -4554,6 +4556,64 @@ function startPolling() {
     def _save_runtime_state(self) -> None:
         self.save_data("runtime_state", self._runtime_state or {})
 
+    def _get_cd2_watch_notice_lock(self):
+        lock = getattr(self, "_cd2_watch_notice_lock", None)
+        if lock is None:
+            lock = _threading_mod.Lock()
+            self._cd2_watch_notice_lock = lock
+        return lock
+
+    @staticmethod
+    def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value))
+        except Exception:
+            return None
+
+    def _prune_cd2_watch_pending_notices(self, notices: Optional[List[dict]] = None) -> List[dict]:
+        notices = notices if notices is not None else self._load_runtime_state().get("cd2_watch_pending_notices")
+        if not isinstance(notices, list):
+            return []
+        now = datetime.now()
+        pruned = []
+        seen = set()
+        for item in notices:
+            if not isinstance(item, dict):
+                continue
+            created_at = self._parse_iso_datetime(
+                item.get("copy_completed_at") or item.get("queued_at") or item.get("created_at")
+            )
+            if created_at and (now - created_at).total_seconds() > self._CD2_WATCH_NOTICE_TTL_SECONDS:
+                continue
+            key = str(item.get("key") or "")
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            pruned.append(item)
+        return pruned
+
+    def _load_cd2_watch_pending_notices(self) -> List[dict]:
+        return self._prune_cd2_watch_pending_notices()
+
+    def _save_cd2_watch_pending_notices(self, notices: List[dict]) -> None:
+        state = self._load_runtime_state()
+        cleaned = self._prune_cd2_watch_pending_notices(notices)
+        if cleaned:
+            state["cd2_watch_pending_notices"] = cleaned
+        else:
+            state.pop("cd2_watch_pending_notices", None)
+        self._save_runtime_state()
+
+    def _append_cd2_watch_pending_notices(self, notices: List[dict]) -> None:
+        if not notices:
+            return
+        merged = self._load_cd2_watch_pending_notices()
+        merged.extend(notices)
+        self._save_cd2_watch_pending_notices(merged)
+
     def _is_115_cooldown_active(self, reason: str = "") -> bool:
         state = self._load_runtime_state()
         until_raw = state.get("115_cooldown_until")
@@ -4851,19 +4911,34 @@ function startPolling() {
                 previous_cached_episodes.add(int(ep))
             except (TypeError, ValueError):
                 continue
-        real_existing_episodes = self._get_existing_episodes(title, tmdb_id, media_type_str, season)
+        real_existing_episodes = self._get_existing_episodes(
+            title,
+            tmdb_id,
+            media_type_str,
+            season,
+            cached_episodes=sorted(previous_cached_episodes),
+        )
         real_existing_set = set(real_existing_episodes)
         logger.info(f"【115助手】{title} 已入库集数: {real_existing_episodes}")
         newly_existing = sorted(real_existing_set - previous_cached_episodes)
         if previous_cached_episodes and newly_existing and self._notify and media_type_str != "电影":
             try:
-                self._post_organize_success_template_message(
-                    subscription=sub,
-                    episodes=newly_existing,
-                    reason="巡检确认 115 入库",
-                )
-                ep_text = self._format_episode_preview(newly_existing)
-                logger.info(f"【115助手】{title} 发送新增入库补偿通知: {ep_text}")
+                notice_episodes, skipped_episodes = self._filter_plugin_notice_episodes(sub, newly_existing)
+                if skipped_episodes:
+                    logger.info(
+                        f"【115助手】{title} MP 本体已有整理历史，跳过插件补通知: "
+                        f"{self._format_episode_preview(skipped_episodes)}"
+                    )
+                if notice_episodes:
+                    self._post_organize_success_template_message(
+                        subscription=sub,
+                        episodes=notice_episodes,
+                        reason="巡检确认 115 入库",
+                    )
+                    ep_text = self._format_episode_preview(notice_episodes)
+                    logger.info(f"【115助手】{title} 发送新增入库补偿通知: {ep_text}")
+                else:
+                    logger.info(f"【115助手】{title} 新增集数均已有 MP 整理历史，无需插件补通知")
             except Exception as e:
                 logger.warning(f"【115助手】{title} 发送新增入库补偿通知失败: {e}")
 
@@ -5578,7 +5653,16 @@ function startPolling() {
         if not pending_episodes:
             return 0
 
-        real_existing = set(self._get_existing_episodes(title, tmdb_id, media_type_str, season))
+        cached_existing = subscription.get("_cache_existing_episodes") or []
+        real_existing = set(
+            self._get_existing_episodes(
+                title,
+                tmdb_id,
+                media_type_str,
+                season,
+                cached_episodes=cached_existing,
+            )
+        )
         before_existing = set(real_existing)
         pending_episodes = sorted(set(pending_episodes) - real_existing)
         if not pending_episodes:
@@ -5661,7 +5745,14 @@ function startPolling() {
             time.sleep(0.5)
 
         refreshed_existing = set(
-            self._get_existing_episodes(title, tmdb_id, media_type_str, season, force_refresh=True)
+            self._get_existing_episodes(
+                title,
+                tmdb_id,
+                media_type_str,
+                season,
+                force_refresh=True,
+                cached_episodes=subscription.get("_cache_existing_episodes") or [],
+            )
         )
         newly_existing = sorted(refreshed_existing - before_existing)
         remaining = sorted(set(pending_episodes) - refreshed_existing)
@@ -5685,12 +5776,21 @@ function startPolling() {
             subscription["_cache_pending_episodes"] = []
             subscription["_cache_pending_since"] = ""
         if newly_existing and self._notify:
-            self._post_organize_success_template_message(
-                subscription=subscription,
-                episodes=newly_existing,
-                source_files=files,
-                reason="待入库重试确认 115 入库",
+            notice_episodes, skipped_episodes = self._filter_plugin_notice_episodes(
+                subscription, newly_existing
             )
+            if skipped_episodes:
+                logger.info(
+                    f"【115助手】{title} 待入库重试结果已有 MP 整理历史，跳过插件补通知: "
+                    f"{self._format_episode_preview(skipped_episodes)}"
+                )
+            if notice_episodes:
+                self._post_organize_success_template_message(
+                    subscription=subscription,
+                    episodes=notice_episodes,
+                    source_files=files,
+                    reason="待入库重试确认 115 入库",
+                )
         subscription["_cache_updated"] = datetime.now().isoformat()
         return submitted
 
@@ -5789,6 +5889,39 @@ function startPolling() {
             seen.add(key)
             result.append(item)
         return result
+
+    def _filter_plugin_notice_episodes(
+        self,
+        subscription: dict,
+        episodes: List[int],
+    ) -> Tuple[List[int], List[int]]:
+        """
+        只保留需要插件补发的集数。
+
+        MP 本体整理成功会写入 TransferHistory，并已经负责发送入库通知；
+        插件补通知只覆盖“媒体库已出现，但 MP 没有整理历史”的漏通知场景。
+        """
+        cleaned = sorted({int(ep) for ep in episodes if ep is not None})
+        if not cleaned:
+            return [], []
+
+        media_type_str = subscription.get("media_type", "电视剧")
+        if media_type_str == "电影":
+            return cleaned, []
+
+        history_episodes = set(
+            self._get_transfer_history_episodes(
+                subscription.get("tmdb_id"),
+                media_type_str,
+                subscription.get("season"),
+            )
+        )
+        if not history_episodes:
+            return cleaned, []
+
+        skipped = sorted(set(cleaned) & history_episodes)
+        notice = [ep for ep in cleaned if ep not in history_episodes]
+        return notice, skipped
 
     def _summarize_notice_files(
         self,
@@ -5893,15 +6026,16 @@ function startPolling() {
         episodes: List[int],
         source_files: Optional[List[dict]] = None,
         reason: str = "",
+        source_label: str = "115入库",
     ) -> None:
         """使用 MP 原生“整理入库成功”模板发送 115 入库确认通知。"""
         cleaned = sorted({int(ep) for ep in episodes if ep is not None})
-        if not cleaned:
+        media_type_str = subscription.get("media_type", "电视剧")
+        if media_type_str != "电影" and not cleaned:
             return
 
         title = subscription.get("title", "")
         tmdb_id = subscription.get("tmdb_id")
-        media_type_str = subscription.get("media_type", "电视剧")
         season = subscription.get("season")
 
         notice_files = self._collect_notice_files_from_history(
@@ -5915,14 +6049,25 @@ function startPolling() {
 
         file_count, total_size, sample_name = self._summarize_notice_files(cleaned, notice_files)
         meta, mediainfo = self._build_notification_media_context(subscription, cleaned, sample_name)
-        season_episode = self._format_system_season_episode(season, cleaned)
+        season_episode = (
+            self._format_system_season_episode(season, cleaned)
+            if media_type_str != "电影"
+            else None
+        )
 
         if not mediainfo:
-            ep_text = self._format_episode_preview(cleaned)
+            ep_text = self._format_episode_preview(cleaned) if cleaned else ""
+            text = reason or f"{source_label}确认入库"
+            if ep_text:
+                text = f"{text}，新增集数：{ep_text}"
             self.post_message(
                 mtype=NotificationType.Organize,
-                title=f"{title} {season_episode} 已入库",
-                text=f"{reason or '115入库确认'}，新增集数：{ep_text}",
+                title=(
+                    f"{title} {season_episode} 已入库"
+                    if season_episode
+                    else f"{title} 已入库"
+                ),
+                text=text,
             )
             return
 
@@ -5941,11 +6086,11 @@ function startPolling() {
             mediainfo=mediainfo,
             transferinfo=transferinfo,
             season_episode=season_episode,
-            source="115入库",
+            source=source_label,
         )
         logger.info(
-            f"【115助手】{title} 已按 MP 入库模板发送 115 入库确认通知: "
-            f"{season_episode}, files={file_count}, size={total_size}"
+            f"【115助手】{title} 已按 MP 入库模板发送通知: "
+            f"{season_episode or 'MOVIE'}, files={file_count}, size={total_size}, source={source_label}"
         )
 
     def _notify_token_expired(self, source: str, detail: str = "") -> None:
@@ -6428,13 +6573,145 @@ function startPolling() {
             list(episodes or []),
         )
 
+    @staticmethod
+    def _normalize_existing_episode_hint(episodes: Optional[List[int]], media_type_str: str) -> List[int]:
+        if not episodes:
+            return []
+        normalized = set()
+        for ep in episodes:
+            try:
+                value = int(ep)
+            except (TypeError, ValueError):
+                continue
+            if media_type_str == "电影" and value == -1:
+                return [-1]
+            if value > 0:
+                normalized.add(value)
+        return sorted(normalized)
+
+    def _get_mediaserver_existing_episodes(
+        self,
+        tmdb_id: Optional[int],
+        media_type_str: str,
+        season: Optional[int],
+    ) -> List[int]:
+        """
+        从 MP 的 mediaserveritem 索引读取 Plex/Emby 已入库状态。
+        默认巡检优先依赖这里，避免频繁读取 115 正式库目录。
+        """
+        if not tmdb_id:
+            return []
+
+        db_paths = [
+            settings.CONFIG_PATH / "user.db",
+            settings.CONFIG_PATH / "moviepilot.db",
+            settings.CONFIG_PATH / "app.db",
+        ]
+        target_season = str(int(season or 1))
+        rows = []
+
+        for db_path in db_paths:
+            try:
+                if not db_path.exists():
+                    continue
+                with sqlite3.connect(str(db_path), timeout=2) as conn:
+                    conn.row_factory = sqlite3.Row
+                    query = (
+                        "SELECT server, seasoninfo FROM mediaserveritem "
+                        "WHERE tmdbid = ? AND item_type = ? AND lower(coalesce(server, '')) IN ('plex', 'emby')"
+                    )
+                    rows = conn.execute(query, (int(tmdb_id), media_type_str)).fetchall()
+                    if rows:
+                        break
+            except Exception as e:
+                logger.debug(f"【115助手】读取 mediaserveritem 失败 {db_path}: {e}")
+
+        if not rows:
+            return []
+
+        if media_type_str == "电影":
+            logger.info(f"【115助手】电影 TMDB={tmdb_id} 已在 Plex/Emby 媒体索引中")
+            return [-1]
+
+        episodes = set()
+        for row in rows:
+            seasoninfo = row["seasoninfo"] if isinstance(row, sqlite3.Row) else None
+            if not seasoninfo:
+                continue
+            try:
+                if isinstance(seasoninfo, str):
+                    seasoninfo = json.loads(seasoninfo)
+            except Exception:
+                continue
+            if not isinstance(seasoninfo, dict):
+                continue
+            for ep in seasoninfo.get(target_season, []) or []:
+                try:
+                    ep_num = int(ep)
+                except (TypeError, ValueError):
+                    continue
+                if ep_num > 0:
+                    episodes.add(ep_num)
+
+        result = sorted(episodes)
+        if result:
+            logger.info(f"【115助手】TMDB={tmdb_id} S{int(season or 1):02d} 已在 Plex/Emby 索引中: {result}")
+        return result
+
+    def _get_library_existing_episodes(
+        self,
+        title: str,
+        tmdb_id: Optional[int],
+        media_type_str: str,
+        season: Optional[int],
+    ) -> List[int]:
+        """
+        显式强刷时才兜底读取媒体库文件系统（可能命中 115 正式库）。
+        """
+        self._apply_tmdb_settings()
+        media_chain = MediaChain()
+        meta = ParseMeta(title)
+        if season:
+            meta.begin_season = season
+        if media_type_str == "电影":
+            meta.type = MediaType.MOVIE
+        else:
+            meta.type = MediaType.TV
+
+        mediainfo = media_chain.recognize_by_meta(meta)
+        if not mediainfo:
+            return []
+
+        if tmdb_id and mediainfo.tmdb_id != tmdb_id:
+            mediainfo.tmdb_id = tmdb_id
+
+        existsinfo = media_chain.media_exists(mediainfo)
+        if not existsinfo:
+            return []
+
+        if media_type_str == "电影":
+            return [-1]
+
+        if not existsinfo.seasons:
+            return []
+
+        target_season = season or 1
+        return sorted({
+            int(ep)
+            for ep in (existsinfo.seasons.get(target_season, []) or [])
+            if ep is not None
+        })
+
     def _get_existing_episodes(self, title: str, tmdb_id: Optional[int],
                                media_type_str: str, season: Optional[int],
-                               force_refresh: bool = False) -> List[int]:
+                               force_refresh: bool = False,
+                               cached_episodes: Optional[List[int]] = None) -> List[int]:
         """
         获取媒体库中已有的集数。
         电影：存在则返回 [-1]（哨兵值），不存在返回 []。
         电视剧：返回已有的集数列表。
+        默认只依赖插件缓存、MP 整理历史、Plex/Emby 媒体索引；
+        仅在 force_refresh=True 时，才兜底读取媒体库文件系统。
         """
         cache_key = self._existing_episodes_cache_key(title, tmdb_id, media_type_str, season)
         if not force_refresh:
@@ -6444,55 +6721,55 @@ function startPolling() {
                 return cached
 
         try:
+            cached_hint = self._normalize_existing_episode_hint(cached_episodes, media_type_str)
             history_episodes = self._get_transfer_history_episodes(tmdb_id, media_type_str, season)
-            self._apply_tmdb_settings()
-            media_chain = MediaChain()
-            meta = ParseMeta(title)
-            if season:
-                meta.begin_season = season
+            mediaserver_episodes = self._get_mediaserver_existing_episodes(
+                tmdb_id=tmdb_id,
+                media_type_str=media_type_str,
+                season=season,
+            )
+
             if media_type_str == "电影":
-                meta.type = MediaType.MOVIE
-            else:
-                meta.type = MediaType.TV
-
-            mediainfo = media_chain.recognize_by_meta(meta)
-            if not mediainfo:
-                self._set_existing_episodes_cache(cache_key, history_episodes)
-                return history_episodes
-
-            if tmdb_id and mediainfo.tmdb_id != tmdb_id:
-                mediainfo.tmdb_id = tmdb_id
-
-            existsinfo = media_chain.media_exists(mediainfo)
-            if not existsinfo:
-                self._set_existing_episodes_cache(cache_key, history_episodes)
-                return history_episodes
-
-            # 电影：只要 existsinfo 不为空就说明已存在
-            if media_type_str == "电影":
-                # existsinfo 有值就说明库里有这部电影
-                logger.info(f"【115助手】电影 {title} 已在媒体库中")
-                result = [-1]  # 哨兵值，表示电影已存在
+                if -1 in cached_hint or -1 in history_episodes or -1 in mediaserver_episodes:
+                    result = [-1]
+                    self._set_existing_episodes_cache(cache_key, result)
+                    return result
+                if not force_refresh:
+                    self._set_existing_episodes_cache(cache_key, [])
+                    return []
+                library_episodes = self._get_library_existing_episodes(
+                    title=title,
+                    tmdb_id=tmdb_id,
+                    media_type_str=media_type_str,
+                    season=season,
+                )
+                result = [-1] if -1 in library_episodes else []
                 self._set_existing_episodes_cache(cache_key, result)
                 return result
 
-            if not existsinfo.seasons:
-                self._set_existing_episodes_cache(cache_key, history_episodes)
-                return history_episodes
-
-            target_season = season or 1
-            media_server_episodes = existsinfo.seasons.get(target_season, [])
-            merged_episodes = sorted(set(media_server_episodes) | set(history_episodes))
-            if history_episodes:
+            merged_episodes = sorted(set(cached_hint) | set(history_episodes) | set(mediaserver_episodes))
+            if history_episodes or mediaserver_episodes or cached_hint:
                 logger.info(
-                    f"【115助手】{title} 合并 MP 入库历史集数: {history_episodes} -> {merged_episodes}"
+                    f"【115助手】{title} 合并缓存/整理历史/Plex-Emby 集数: "
+                    f"cache={cached_hint}, history={history_episodes}, media={mediaserver_episodes} -> {merged_episodes}"
                 )
+            if not force_refresh:
+                self._set_existing_episodes_cache(cache_key, merged_episodes)
+                return merged_episodes
+
+            library_episodes = self._get_library_existing_episodes(
+                title=title,
+                tmdb_id=tmdb_id,
+                media_type_str=media_type_str,
+                season=season,
+            )
+            merged_episodes = sorted(set(merged_episodes) | set(library_episodes))
             self._set_existing_episodes_cache(cache_key, merged_episodes)
             return merged_episodes
 
         except Exception as e:
             logger.warning(f"【115助手】获取已有集数失败: {e}")
-            return []
+            return self._normalize_existing_episode_hint(cached_episodes, media_type_str)
 
     def _get_transfer_history_episodes(self, tmdb_id: Optional[int],
                                        media_type_str: str,
@@ -8508,6 +8785,293 @@ function startPolling() {
             # 某些版本的 MessageHelper 不支持 mtype 参数
             self.systemmessage.put(title=title, message=text)
 
+    @staticmethod
+    def _classify_cd2_watch_media(dest_path: str) -> Tuple[str, str]:
+        category = PurePosixPath(str(dest_path or "/")).name or ""
+        lower_dest = str(dest_path or "").lower()
+        if "/movie" in lower_dest or "电影" in lower_dest:
+            return "电影", category or "Movie"
+        if "/variety" in lower_dest or "综艺" in lower_dest:
+            return "电视剧", category or "Variety"
+        return "电视剧", category or "TV"
+
+    def _build_cd2_watch_notice_records(
+        self,
+        rule_name: str,
+        show_name: str,
+        dest_path: str,
+        media_type_str: str,
+        category: str,
+        video_items_by_season: Dict[int, List[dict]],
+    ) -> List[dict]:
+        title = self._strip_year(show_name) or show_name
+        year = self._extract_year(show_name)
+        records: List[dict] = []
+
+        if media_type_str == "电影":
+            movie_files = []
+            for _, files in sorted(video_items_by_season.items()):
+                movie_files.extend(files)
+            if not movie_files:
+                return []
+            records.append({
+                "rule_name": rule_name,
+                "raw_name": show_name,
+                "title": title,
+                "year": year,
+                "media_type": media_type_str,
+                "category": category,
+                "season": None,
+                "episodes": [],
+                "source_files": movie_files,
+                "target_path": movie_files[0].get("path"),
+            })
+            return records
+
+        for season, files in sorted(video_items_by_season.items()):
+            if not files:
+                continue
+            episodes = sorted({
+                int(item.get("episode"))
+                for item in files
+                if item.get("episode") is not None
+            })
+            records.append({
+                "rule_name": rule_name,
+                "raw_name": show_name,
+                "title": title,
+                "year": year,
+                "media_type": media_type_str,
+                "category": category,
+                "season": int(season or 1),
+                "episodes": episodes,
+                "source_files": files,
+                "target_path": files[0].get("path"),
+            })
+        return records
+
+    def _build_cd2_watch_refresh_items(self, notices: List[dict]) -> List[Any]:
+        if not notices:
+            return []
+        try:
+            from app.schemas.mediaserver import RefreshMediaItem
+        except Exception:
+            try:
+                from app.schemas import RefreshMediaItem
+            except Exception as e:
+                logger.warning(f"【CD2巡查】导入 RefreshMediaItem 失败，跳过媒体库局部刷新: {e}")
+                return []
+
+        items = []
+        seen = set()
+        for notice in notices:
+            target_path = notice.get("target_path")
+            title = str(notice.get("title") or "").strip()
+            if not target_path or not title:
+                continue
+            key = f"{title}|{notice.get('year')}|{target_path}"
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(
+                RefreshMediaItem(
+                    title=title,
+                    year=notice.get("year"),
+                    type=MediaType.MOVIE if notice.get("media_type") == "电影" else MediaType.TV,
+                    category=notice.get("category"),
+                    target_path=Path(str(target_path)),
+                )
+            )
+        return items
+
+    def _refresh_cd2_watch_mediaservers(self, notices: List[dict]) -> List[str]:
+        items = self._build_cd2_watch_refresh_items(notices)
+        if not items:
+            return []
+        try:
+            from app.helper.mediaserver import MediaServerHelper
+        except Exception as e:
+            logger.warning(f"【CD2巡查】导入 MediaServerHelper 失败，跳过媒体库局部刷新: {e}")
+            return []
+
+        services = MediaServerHelper().get_services() or {}
+        if not services:
+            logger.info("【CD2巡查】未配置可用媒体服务器，跳过媒体库局部刷新")
+            return []
+
+        refreshed = []
+        for name, service in services.items():
+            instance = getattr(service, "instance", None)
+            if not instance:
+                continue
+            try:
+                if hasattr(instance, "is_inactive") and instance.is_inactive():
+                    logger.info(f"【CD2巡查】媒体服务器 {name} 当前未连接，跳过局部刷新")
+                    continue
+            except Exception:
+                pass
+
+            if not hasattr(instance, "refresh_library_by_items"):
+                logger.info(f"【CD2巡查】媒体服务器 {name} 不支持局部刷新，跳过全库刷新")
+                continue
+
+            try:
+                instance.refresh_library_by_items(items)
+                refreshed.append(name)
+            except Exception as e:
+                logger.warning(f"【CD2巡查】媒体服务器 {name} 局部刷新失败: {e}")
+        return refreshed
+
+    @staticmethod
+    def _build_cd2_watch_subscription(record: dict) -> dict:
+        return {
+            "title": str(record.get("title") or record.get("raw_name") or "").strip(),
+            "tmdb_id": record.get("tmdb_id"),
+            "media_type": record.get("media_type") or "电视剧",
+            "season": record.get("season") or 1,
+            "year": record.get("year"),
+        }
+
+    def _is_cd2_watch_notice_confirmed(self, record: dict) -> bool:
+        subscription = self._build_cd2_watch_subscription(record)
+        episodes = sorted({int(ep) for ep in (record.get("episodes") or []) if ep is not None})
+        source_files = record.get("source_files") or []
+        sample_name = str(
+            (source_files[0].get("name") if source_files else "")
+            or record.get("raw_name")
+            or subscription.get("title")
+            or ""
+        )
+        _, mediainfo = self._build_notification_media_context(subscription, episodes, sample_name)
+        if not mediainfo:
+            return False
+
+        tmdb_id = getattr(mediainfo, "tmdb_id", None)
+        try:
+            tmdb_id = int(tmdb_id) if tmdb_id not in (None, "") else None
+        except (TypeError, ValueError):
+            tmdb_id = None
+        if tmdb_id:
+            record["tmdb_id"] = tmdb_id
+
+        media_type_str = subscription.get("media_type", "电视剧")
+        season = int(subscription.get("season") or 1)
+        existing_eps = set(
+            self._get_existing_episodes(
+                title=subscription.get("title") or "",
+                tmdb_id=record.get("tmdb_id"),
+                media_type_str=media_type_str,
+                season=season,
+            )
+        )
+        if media_type_str == "电影":
+            return -1 in existing_eps
+        if not episodes:
+            return bool(existing_eps)
+        return set(episodes).issubset(existing_eps)
+
+    def _send_cd2_watch_notice_record(self, record: dict) -> None:
+        subscription = self._build_cd2_watch_subscription(record)
+        media_type_str = subscription.get("media_type", "电视剧")
+        episodes = sorted({int(ep) for ep in (record.get("episodes") or []) if ep is not None})
+
+        if media_type_str != "电影":
+            notice_episodes, skipped_episodes = self._filter_plugin_notice_episodes(subscription, episodes)
+            if skipped_episodes:
+                logger.info(
+                    f"【CD2巡查】{subscription.get('title')} 已有 MP 整理历史，跳过插件补通知: "
+                    f"{self._format_episode_preview(skipped_episodes)}"
+                )
+            if episodes and not notice_episodes:
+                return
+            episodes = notice_episodes
+
+        if media_type_str != "电影" and not episodes:
+            title = str(subscription.get("title") or record.get("raw_name") or "").strip()
+            self.post_message(
+                NotificationType.Organize,
+                f"{title} 已入库",
+                "CD2巡查确认入库",
+            )
+            return
+
+        self._post_organize_success_template_message(
+            subscription=subscription,
+            episodes=episodes,
+            source_files=record.get("source_files") or [],
+            reason="CD2巡查确认入库",
+            source_label="CD2巡查入库",
+        )
+
+    def _confirm_cd2_watch_pending_notices(
+        self,
+        reason: str = "",
+        initial_delay: int = 20,
+        rounds: int = 3,
+        sleep_seconds: int = 60,
+    ) -> None:
+        lock = self._get_cd2_watch_notice_lock()
+        if not lock.acquire(blocking=False):
+            logger.info(f"【CD2巡查】入库确认任务已在运行，跳过触发: {reason}")
+            return
+        try:
+            if initial_delay > 0:
+                time.sleep(initial_delay)
+
+            for round_index in range(max(int(rounds or 1), 1)):
+                notices = self._load_cd2_watch_pending_notices()
+                if not notices:
+                    return
+
+                remaining = []
+                confirmed = 0
+                for notice in notices:
+                    try:
+                        if self._is_cd2_watch_notice_confirmed(notice):
+                            self._send_cd2_watch_notice_record(notice)
+                            confirmed += 1
+                        else:
+                            notice["confirm_attempts"] = int(notice.get("confirm_attempts") or 0) + 1
+                            remaining.append(notice)
+                    except Exception as e:
+                        logger.warning(f"【CD2巡查】确认入库通知失败 {notice.get('title')}: {e}")
+                        notice["confirm_attempts"] = int(notice.get("confirm_attempts") or 0) + 1
+                        remaining.append(notice)
+
+                self._save_cd2_watch_pending_notices(remaining)
+                if confirmed:
+                    logger.info(f"【CD2巡查】本轮已确认并发送 {confirmed} 条入库通知")
+                if not remaining or round_index >= max(int(rounds or 1), 1) - 1:
+                    return
+
+                self._refresh_cd2_watch_mediaservers(remaining)
+                time.sleep(sleep_seconds)
+        finally:
+            lock.release()
+
+    def _start_cd2_watch_notice_background(
+        self,
+        reason: str = "",
+        initial_delay: int = 20,
+        rounds: int = 3,
+        sleep_seconds: int = 60,
+    ) -> bool:
+        lock = self._get_cd2_watch_notice_lock()
+        if lock.locked():
+            logger.info(f"【CD2巡查】入库确认后台任务已在运行，跳过重复触发: {reason}")
+            return False
+        _threading_mod.Thread(
+            target=self._confirm_cd2_watch_pending_notices,
+            kwargs={
+                "reason": reason,
+                "initial_delay": initial_delay,
+                "rounds": rounds,
+                "sleep_seconds": sleep_seconds,
+            },
+            daemon=True,
+        ).start()
+        return True
+
     # ================================================================
     #  CD2 巡查同步
     # ================================================================
@@ -8673,21 +9237,22 @@ function startPolling() {
             eps |= season_eps
         return eps
 
-    def _sync_cd2_rule(self, rule: dict, cd2) -> int:
+    def _sync_cd2_rule(self, rule: dict, cd2) -> dict:
         """
         执行单条巡查规则：
         - 列出源路径下的一级子目录（每个目录=一部剧）
         - 对每部剧，在 dest_115_path 下找对应目录
         - 比对集号差异，复制缺失文件
-        返回本次复制的文件数量。
+        返回本次复制数量及后续待确认入库通知的记录。
         """
         source_path = rule.get("source_path", "").rstrip("/")
         dest_path = rule.get("dest_115_path", "").rstrip("/")
         rule_name = rule.get("name", source_path)
+        media_type_str, category = self._classify_cd2_watch_media(dest_path)
 
         if not source_path or not dest_path:
             logger.warning(f"【CD2巡查】规则 {rule_name!r} 缺少路径配置，跳过")
-            return 0
+            return {"submitted_count": 0, "notice_records": []}
 
         logger.info(f"【CD2巡查】开始巡查规则: {rule_name!r} | {source_path} → {dest_path}")
 
@@ -8696,14 +9261,15 @@ function startPolling() {
             src_shows = cd2.list_dir(source_path, force_refresh=True)
         except Exception as e:
             logger.error(f"【CD2巡查】列出源目录失败 {source_path}: {e}")
-            return 0
+            return {"submitted_count": 0, "notice_records": []}
 
         src_show_dirs = [f for f in src_shows if f.get("is_dir")]
         if not src_show_dirs:
             logger.info(f"【CD2巡查】源目录为空: {source_path}")
-            return 0
+            return {"submitted_count": 0, "notice_records": []}
 
         total_copied = 0
+        notice_records: List[dict] = []
 
         for show in src_show_dirs:
             show_name = show["name"]
@@ -8727,8 +9293,72 @@ function startPolling() {
 
             # 在目标路径找对应剧目录
             dest_show_path = self._find_matching_show_dir(cd2, dest_path, show_name)
+            show_notice_records: List[dict] = []
+            missing_by_dest: Dict[str, List[str]] = {}
 
-            if dest_show_path:
+            if media_type_str == "电影":
+                video_items_by_season: Dict[int, List[dict]] = {1: []}
+                if dest_show_path:
+                    try:
+                        dest_movie_files = self._list_recursive(cd2, dest_show_path, force_refresh=True)
+                    except Exception as e:
+                        logger.warning(f"【CD2巡查】列出目标电影目录失败 {dest_show_path}: {e}")
+                        dest_movie_files = []
+
+                    dest_has_video = any(
+                        not item.get("is_dir")
+                        and os.path.splitext(item.get("name", ""))[1].lower() in self._video_extensions
+                        for item in dest_movie_files
+                    )
+                    if dest_has_video:
+                        logger.info(f"【CD2巡查】{show_name!r} 目标已有视频文件，跳过电影复制")
+                        continue
+
+                    movie_file_paths = []
+                    for file_item in src_files_all:
+                        if file_item.get("is_dir"):
+                            continue
+                        ext = os.path.splitext(file_item["name"])[1].lower()
+                        if ext not in self._video_extensions and ext not in self._COMPANION_EXTENSIONS:
+                            continue
+                        movie_file_paths.append(file_item["path"])
+                        if ext in self._video_extensions:
+                            video_items_by_season[1].append({
+                                "name": file_item["name"],
+                                "path": str(PurePosixPath(dest_show_path) / file_item["name"]),
+                                "size": int(file_item.get("size", 0) or 0),
+                                "episode": None,
+                            })
+
+                    if not movie_file_paths:
+                        continue
+                    missing_by_dest = {dest_show_path: movie_file_paths}
+                else:
+                    target_show_path = str(PurePosixPath(dest_path) / show_name)
+                    for file_item in src_video_files:
+                        src_file_path = PurePosixPath(file_item["path"])
+                        try:
+                            rel_path = src_file_path.relative_to(PurePosixPath(show_path))
+                        except Exception:
+                            rel_path = PurePosixPath(file_item["name"])
+                        video_items_by_season[1].append({
+                            "name": file_item["name"],
+                            "path": str(PurePosixPath(target_show_path) / rel_path),
+                            "size": int(file_item.get("size", 0) or 0),
+                            "episode": None,
+                        })
+                    missing_by_dest = {dest_path: [show_path]}
+                    logger.info(f"【CD2巡查】{show_name!r} 目标无对应目录，整体复制电影目录")
+
+                show_notice_records = self._build_cd2_watch_notice_records(
+                    rule_name=rule_name,
+                    show_name=show_name,
+                    dest_path=dest_path,
+                    media_type_str=media_type_str,
+                    category=category,
+                    video_items_by_season=video_items_by_season,
+                )
+            elif dest_show_path:
                 # 已有剧目录 → 增量对比
                 dest_eps_by_season = self._get_dest_episodes_by_season(cd2, dest_show_path)
                 logger.info(
@@ -8771,10 +9401,28 @@ function startPolling() {
                     if ep in missing_eps_by_season.get(file_season, set()):
                         missing_files.append(f)
 
-                missing_by_dest: Dict[str, List[str]] = {}
+                season_dest_dirs: Dict[int, str] = {}
+                video_items_by_season: Dict[int, List[dict]] = {}
+                for f in missing_video_files:
+                    file_season = self._infer_file_season(f)
+                    copy_dest = season_dest_dirs.get(file_season)
+                    if not copy_dest:
+                        copy_dest = self._find_or_create_season_dir(cd2, dest_show_path, file_season)
+                        season_dest_dirs[file_season] = copy_dest
+                    target_file_path = str(PurePosixPath(copy_dest) / f["name"])
+                    video_items_by_season.setdefault(file_season, []).append({
+                        "name": f["name"],
+                        "path": target_file_path,
+                        "size": int(f.get("size", 0) or 0),
+                        "episode": self._parse_episode_number(f["name"]),
+                    })
+
                 for f in missing_files:
                     file_season = self._infer_file_season(f)
-                    copy_dest = self._find_or_create_season_dir(cd2, dest_show_path, file_season)
+                    copy_dest = season_dest_dirs.get(file_season)
+                    if not copy_dest:
+                        copy_dest = self._find_or_create_season_dir(cd2, dest_show_path, file_season)
+                        season_dest_dirs[file_season] = copy_dest
                     missing_by_dest.setdefault(copy_dest, []).append(f["path"])
 
                 ep_nums = sorted({
@@ -8786,16 +9434,49 @@ function startPolling() {
                     f"【CD2巡查】{show_name!r} 缺失 {len(missing_video_files)} 个视频"
                     f"（集号: {ep_nums}），连同伴随文件共 {len(missing_files)} 项，开始复制"
                 )
+                show_notice_records = self._build_cd2_watch_notice_records(
+                    rule_name=rule_name,
+                    show_name=show_name,
+                    dest_path=dest_path,
+                    media_type_str=media_type_str,
+                    category=category,
+                    video_items_by_season=video_items_by_season,
+                )
             else:
                 # 目标没有此剧 → 整个目录复制
                 logger.info(f"【CD2巡查】{show_name!r} 目标无对应目录，整体复制")
                 missing_by_dest = {dest_path: [show_path]}
+                target_show_path = str(PurePosixPath(dest_path) / show_name)
+                video_items_by_season: Dict[int, List[dict]] = {}
+                for file_item in src_video_files:
+                    file_season = self._infer_file_season(file_item)
+                    src_file_path = PurePosixPath(file_item["path"])
+                    try:
+                        rel_path = src_file_path.relative_to(PurePosixPath(show_path))
+                    except Exception:
+                        rel_path = PurePosixPath(file_item["name"])
+                    video_items_by_season.setdefault(file_season, []).append({
+                        "name": file_item["name"],
+                        "path": str(PurePosixPath(target_show_path) / rel_path),
+                        "size": int(file_item.get("size", 0) or 0),
+                        "episode": self._parse_episode_number(file_item["name"]),
+                    })
+                show_notice_records = self._build_cd2_watch_notice_records(
+                    rule_name=rule_name,
+                    show_name=show_name,
+                    dest_path=dest_path,
+                    media_type_str=media_type_str,
+                    category=category,
+                    video_items_by_season=video_items_by_season,
+                )
 
             # 执行复制
+            successful_destinations = set()
             for copy_dest, missing_paths in missing_by_dest.items():
                 ok = cd2.copy_file(missing_paths, copy_dest)
                 if ok:
                     total_copied += len(missing_paths)
+                    successful_destinations.add(copy_dest)
                     logger.info(
                         f"【CD2巡查】{show_name!r} 复制任务已提交: "
                         f"{len(missing_paths)} 项 -> {copy_dest}"
@@ -8803,7 +9484,23 @@ function startPolling() {
                 else:
                     logger.warning(f"【CD2巡查】{show_name!r} 复制提交失败: {copy_dest}")
 
-        return total_copied
+            if not successful_destinations:
+                continue
+
+            if media_type_str == "电影" and not dest_show_path:
+                notice_records.extend(show_notice_records)
+                continue
+
+            for record in show_notice_records:
+                target_path = str(record.get("target_path") or "")
+                target_parent = str(PurePosixPath(target_path).parent) if target_path else ""
+                if not target_parent or target_parent in successful_destinations or dest_path in successful_destinations:
+                    notice_records.append(record)
+
+        return {
+            "submitted_count": total_copied,
+            "notice_records": notice_records,
+        }
 
     def _list_recursive(self, cd2, path: str, force_refresh: bool = False) -> List[dict]:
         """递归列出路径下所有文件和目录"""
@@ -8843,10 +9540,15 @@ function startPolling() {
         logger.info(f"【CD2巡查】开始巡查，共 {len(active_rules)} 条规则")
 
         total = 0
+        pending_notice_records: List[dict] = []
         for rule in active_rules:
             try:
-                n = self._sync_cd2_rule(rule, cd2)
-                total += n
+                result = self._sync_cd2_rule(rule, cd2)
+                if isinstance(result, dict):
+                    total += int(result.get("submitted_count") or 0)
+                    pending_notice_records.extend(result.get("notice_records") or [])
+                else:
+                    total += int(result or 0)
             except Exception as e:
                 logger.error(f"【CD2巡查】规则 {rule.get('name')!r} 执行异常: {e}")
 
@@ -8856,16 +9558,42 @@ function startPolling() {
             ok = cd2.wait_for_copy(timeout=3600, poll_interval=10)
             if ok:
                 logger.info("【CD2巡查】本次巡查全部复制完成")
+                refreshed_servers: List[str] = []
+                if pending_notice_records:
+                    completed_at = datetime.now().isoformat()
+                    for record in pending_notice_records:
+                        target_path = str(record.get("target_path") or "")
+                        season = record.get("season") or 0
+                        record["copy_completed_at"] = completed_at
+                        record["key"] = f"{record.get('rule_name')}|{target_path}|{season}|{completed_at}"
+                    self._append_cd2_watch_pending_notices(pending_notice_records)
+                    refreshed_servers = self._refresh_cd2_watch_mediaservers(pending_notice_records)
+                    self._start_cd2_watch_notice_background(
+                        reason="CD2巡查复制完成后确认入库",
+                        initial_delay=20,
+                        rounds=3,
+                        sleep_seconds=60,
+                    )
                 if self._notify:
+                    notify_text = f"本次共同步 {total} 个文件"
+                    if refreshed_servers:
+                        notify_text += f"\n已请求局部刷新媒体库: {', '.join(refreshed_servers)}"
                     self.post_message(
                         NotificationType.Plugin,
                         "CD2 巡查同步完成",
-                        f"本次共同步 {total} 个文件",
+                        notify_text,
                     )
             else:
                 logger.warning("【CD2巡查】部分复制任务超时或失败")
         else:
             logger.info("【CD2巡查】本次巡查无新增文件")
+            if self._load_cd2_watch_pending_notices():
+                self._start_cd2_watch_notice_background(
+                    reason="CD2巡查补偿确认待入库通知",
+                    initial_delay=0,
+                    rounds=1,
+                    sleep_seconds=60,
+                )
 
     # ================================================================
     #  停止
