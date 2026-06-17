@@ -62,7 +62,7 @@ class Net115Helper(_PluginBase):
         "一站式管理 115 网盘：Cookie 配置、分类临时目录、"
         "网盘资源订阅（定期搜索 PanSou → 比对缺失集数 → 自动转存）。"
     )
-    plugin_version = "2.1"
+    plugin_version = "2.2"
     plugin_order = 29
     plugin_icon = "https://115.com/favicon.ico"
 
@@ -146,8 +146,11 @@ class Net115Helper(_PluginBase):
 
     # ───────── CD2 巡查同步配置 ─────────
     _cd2_watch_enabled: bool = False
+    _cd2_watch_interval_minutes: int = 120
     _cd2_watch_rules: List[dict] = []   # [{id, enabled, name, source_path, dest_115_path}]
     _CD2_WATCH_NOTICE_TTL_SECONDS = 24 * 3600
+    _CD2_WATCH_INDEX_DATA_KEY = "cd2_watch_index_v1"
+    _CD2_WATCH_ARCHIVE_LIMIT = 200
 
     # ================================================================
     #  初始化 / 状态
@@ -328,6 +331,10 @@ class Net115Helper(_PluginBase):
 
         # ---- CD2 巡查同步配置 ----
         self._cd2_watch_enabled = config.get("cd2_watch_enabled", False)
+        try:
+            self._cd2_watch_interval_minutes = max(30, int(config.get("cd2_watch_interval_minutes", 120)))
+        except (TypeError, ValueError):
+            self._cd2_watch_interval_minutes = 120
         watch_rules = config.get("cd2_watch_rules", "[]")
         if isinstance(watch_rules, str):
             try:
@@ -746,7 +753,7 @@ class Net115Helper(_PluginBase):
                 "trigger": "interval",
                 "func": self._run_cd2_watch,
                 "kwargs": {
-                    "minutes": self._interval_minutes,
+                    "minutes": self._cd2_watch_interval_minutes,
                 }
             })
         services.append({
@@ -3007,13 +3014,28 @@ function startPolling() {
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12},
+                                "props": {"cols": 12, "md": 6},
                                 "content": [{
                                     "component": "VSwitch",
                                     "props": {
                                         "model": "cd2_watch_enabled",
                                         "label": "启用 CD2 云盘巡查同步",
-                                        "hint": "定期扫描指定云盘目录，将缺失集数增量复制到115（共用上方 CD2 连接配置和检查间隔）",
+                                        "hint": "定期扫描指定云盘目录，将缺失集数增量复制到115；默认依赖本地巡查索引，尽量少读115目标盘。",
+                                        "persistent-hint": True,
+                                    }
+                                }]
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "cd2_watch_interval_minutes",
+                                        "label": "CD2 巡查间隔（分钟）",
+                                        "type": "number",
+                                        "placeholder": "120",
+                                        "hint": "建议 120 分钟；手动点击详情页里的“立即巡查”不受这里限制。",
                                         "persistent-hint": True,
                                     }
                                 }]
@@ -3096,6 +3118,7 @@ function startPolling() {
             "cd2_target_archive_path": "",
             # ── CD2 巡查同步默认值 ──
             "cd2_watch_enabled": False,
+            "cd2_watch_interval_minutes": 120,
             "cd2_watch_rules": "[]",
         }
 
@@ -3592,6 +3615,21 @@ function startPolling() {
     def _build_cd2_watch_card(self) -> dict:
         """构建 CD2 巡查规则管理卡片（详情页）"""
         rules = self._cd2_watch_rules or []
+        watch_index = self._load_cd2_watch_index()
+        rule_states = watch_index.get("rules", {}) if isinstance(watch_index, dict) else {}
+        tracked_shows = 0
+        completed_shows = 0
+        if isinstance(rule_states, dict):
+            for item in rule_states.values():
+                if not isinstance(item, dict):
+                    continue
+                shows = item.get("shows")
+                if isinstance(shows, dict):
+                    tracked_shows += len(shows)
+                    completed_shows += len([
+                        show for show in shows.values()
+                        if isinstance(show, dict) and show.get("completed")
+                    ])
         token_js = "(localStorage.getItem('token')||localStorage.getItem('access_token')||'')"
         auth_js = (
             f"var t={token_js};"
@@ -3852,6 +3890,20 @@ function startPolling() {
                 {
                     "component": "VCardText",
                     "content": [
+                        {
+                            "component": "VAlert",
+                            "props": {
+                                "type": "info",
+                                "variant": "tonal",
+                                "density": "compact",
+                                "class": "mb-3",
+                                "text": (
+                                    f"当前定时巡查间隔：{self._cd2_watch_interval_minutes} 分钟。"
+                                    f"本地巡查索引已记录 {tracked_shows} 部，已标记完结 {completed_shows} 部。"
+                                    "默认优先使用本地索引 + Plex/Emby/整理历史判断缺失，仅在首次同步或手动强刷时读取 115 目标目录。"
+                                ),
+                            },
+                        },
                         {"component": "div", "props": {"class": "text-subtitle-2 mb-2"}, "text": "新增规则（填写后点击保存新规则）"},
                         add_form,
                         {"component": "VDivider", "props": {"class": "my-4"}},
@@ -4555,6 +4607,373 @@ function startPolling() {
 
     def _save_runtime_state(self) -> None:
         self.save_data("runtime_state", self._runtime_state or {})
+
+    @staticmethod
+    def _normalize_episode_map(value: Any) -> Dict[int, List[int]]:
+        result: Dict[int, List[int]] = {}
+        if not isinstance(value, dict):
+            return result
+        for season_key, episodes in value.items():
+            try:
+                season_num = int(season_key)
+            except (TypeError, ValueError):
+                continue
+            cleaned = set()
+            for ep in episodes or []:
+                try:
+                    cleaned.add(int(ep))
+                except (TypeError, ValueError):
+                    continue
+            if cleaned:
+                result[season_num] = sorted(cleaned)
+        return result
+
+    @staticmethod
+    def _episode_map_union(*maps: Dict[int, List[int]]) -> Dict[int, List[int]]:
+        merged: Dict[int, set] = {}
+        for item in maps:
+            for season, episodes in Net115Helper._normalize_episode_map(item).items():
+                merged.setdefault(int(season), set()).update(int(ep) for ep in episodes)
+        return {
+            int(season): sorted(values)
+            for season, values in merged.items()
+            if values
+        }
+
+    @staticmethod
+    def _episode_map_difference(source_map: Dict[int, List[int]],
+                                covered_map: Dict[int, List[int]]) -> Dict[int, List[int]]:
+        source = Net115Helper._normalize_episode_map(source_map)
+        covered = Net115Helper._normalize_episode_map(covered_map)
+        diff: Dict[int, List[int]] = {}
+        for season, episodes in source.items():
+            remain = sorted(set(episodes) - set(covered.get(season, [])))
+            if remain:
+                diff[int(season)] = remain
+        return diff
+
+    @staticmethod
+    def _episode_map_count(value: Any) -> int:
+        total = 0
+        for episodes in Net115Helper._normalize_episode_map(value).values():
+            total += len(episodes)
+        return total
+
+    @staticmethod
+    def _normalize_title_token(text: str) -> str:
+        cleaned = Net115Helper._strip_year(str(text or "")).strip().lower()
+        cleaned = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", cleaned)
+        return cleaned
+
+    def _cd2_watch_rule_key(self, rule: dict) -> str:
+        return str(
+            rule.get("id")
+            or f"{rule.get('source_path', '').strip()}->{rule.get('dest_115_path', '').strip()}"
+        )
+
+    def _cd2_watch_show_key(self, show_name: str, media_type_str: str) -> str:
+        year = self._extract_year(show_name) or 0
+        token = self._normalize_title_token(show_name) or str(show_name or "").strip().lower()
+        return f"{media_type_str}|{token}|{year}"
+
+    def _load_cd2_watch_index(self) -> dict:
+        cached = getattr(self, "_cd2_watch_index_cache", None)
+        if isinstance(cached, dict):
+            return cached
+        raw = self.get_data(self._CD2_WATCH_INDEX_DATA_KEY)
+        if not isinstance(raw, dict):
+            raw = {}
+        index = {
+            "rules": raw.get("rules") if isinstance(raw.get("rules"), dict) else {},
+            "completed": raw.get("completed") if isinstance(raw.get("completed"), list) else [],
+        }
+        self._cd2_watch_index_cache = index
+        return index
+
+    def _save_cd2_watch_index(self, index: dict) -> None:
+        completed = index.get("completed")
+        if isinstance(completed, list) and len(completed) > self._CD2_WATCH_ARCHIVE_LIMIT:
+            index["completed"] = completed[-self._CD2_WATCH_ARCHIVE_LIMIT:]
+        self._cd2_watch_index_cache = index
+        self.save_data(self._CD2_WATCH_INDEX_DATA_KEY, index)
+
+    def _get_cd2_watch_rule_state(self, index: dict, rule: dict) -> dict:
+        rules = index.setdefault("rules", {})
+        rule_key = self._cd2_watch_rule_key(rule)
+        rule_state = rules.setdefault(rule_key, {})
+        rule_state["id"] = rule.get("id") or rule_key
+        rule_state["name"] = rule.get("name") or rule.get("source_path") or rule_key
+        rule_state["source_path"] = rule.get("source_path", "")
+        rule_state["dest_path"] = rule.get("dest_115_path", "")
+        rule_state["updated_at"] = datetime.now().isoformat()
+        if not isinstance(rule_state.get("shows"), dict):
+            rule_state["shows"] = {}
+        return rule_state
+
+    def _split_cd2_watch_pending_map(
+        self,
+        show_state: dict,
+    ) -> Tuple[Dict[int, List[int]], Dict[int, List[int]], int]:
+        pending_map = self._normalize_episode_map(show_state.get("pending_episodes_by_season"))
+        if not pending_map:
+            return {}, {}, 0
+        pending_at_raw = show_state.get("pending_updated_at") or show_state.get("pending_since")
+        pending_at = self._parse_iso_datetime(pending_at_raw)
+        if not pending_at:
+            return {}, pending_map, self._PENDING_COPY_TTL_SECONDS + 1
+        age = int((datetime.now() - pending_at).total_seconds())
+        if age < self._PENDING_COPY_TTL_SECONDS:
+            return pending_map, {}, age
+        return {}, pending_map, age
+
+    def _set_cd2_watch_pending_map(
+        self,
+        show_state: dict,
+        pending_map: Dict[int, List[int]],
+        when: Optional[datetime] = None,
+    ) -> None:
+        cleaned = self._normalize_episode_map(pending_map)
+        if cleaned:
+            ts = (when or datetime.now()).isoformat()
+            show_state["pending_episodes_by_season"] = cleaned
+            show_state["pending_updated_at"] = ts
+            show_state["pending_since"] = ts
+            show_state["pending_count"] = self._episode_map_count(cleaned)
+        else:
+            show_state.pop("pending_episodes_by_season", None)
+            show_state.pop("pending_updated_at", None)
+            show_state.pop("pending_since", None)
+            show_state["pending_count"] = 0
+
+    def _append_cd2_watch_completed_show(
+        self,
+        index: dict,
+        rule_state: dict,
+        show_state: dict,
+        reason: str,
+    ) -> None:
+        completed = index.setdefault("completed", [])
+        completion_key = str(show_state.get("completion_key") or "")
+        if completion_key and any(str(item.get("completion_key") or "") == completion_key for item in completed):
+            return
+        snapshot = {
+            "completion_key": completion_key or (
+                f"{rule_state.get('id')}|{show_state.get('show_key')}|{show_state.get('completed_at')}"
+            ),
+            "rule_id": rule_state.get("id"),
+            "rule_name": rule_state.get("name"),
+            "show_key": show_state.get("show_key"),
+            "show_name": show_state.get("show_name"),
+            "title": show_state.get("title"),
+            "year": show_state.get("year"),
+            "tmdb_id": show_state.get("tmdb_id"),
+            "media_type": show_state.get("media_type"),
+            "total_episodes": show_state.get("total_episodes"),
+            "existing_count": show_state.get("existing_count"),
+            "confirmed_episodes_by_season": self._normalize_episode_map(
+                show_state.get("confirmed_episodes_by_season")
+            ),
+            "completed_at": show_state.get("completed_at"),
+            "completed_reason": reason,
+        }
+        completed.append(snapshot)
+
+    def _resolve_cd2_watch_subscription_match(
+        self,
+        show_name: str,
+        media_type_str: str,
+    ) -> Optional[dict]:
+        show_title = self._strip_year(show_name) or show_name
+        show_token = self._normalize_title_token(show_title)
+        show_year = self._extract_year(show_name)
+        if not show_token:
+            return None
+
+        candidates = []
+        for source_name, collection in (
+            ("active", self._load_subscriptions()),
+            ("history", self._load_history()),
+        ):
+            for item in collection or []:
+                item_type = str(item.get("media_type") or "电视剧")
+                if item_type != media_type_str:
+                    continue
+                title = str(item.get("title") or "").strip()
+                token = self._normalize_title_token(title)
+                if not token:
+                    continue
+                score = 0
+                if token == show_token:
+                    score += 100
+                elif token in show_token or show_token in token:
+                    score += 60
+                else:
+                    continue
+                item_year = item.get("year")
+                try:
+                    item_year = int(item_year) if item_year not in (None, "") else None
+                except (TypeError, ValueError):
+                    item_year = None
+                if show_year and item_year and show_year == item_year:
+                    score += 20
+                if source_name == "active":
+                    score += 10
+                candidates.append((score, dict(item)))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
+
+    def _hydrate_cd2_watch_show_meta(
+        self,
+        show_state: dict,
+        show_name: str,
+        media_type_str: str,
+    ) -> dict:
+        show_state["show_name"] = show_name
+        show_state["media_type"] = media_type_str
+        show_state["title"] = str(show_state.get("title") or self._strip_year(show_name) or show_name).strip()
+        show_state["year"] = show_state.get("year") or self._extract_year(show_name)
+
+        match = self._resolve_cd2_watch_subscription_match(show_name, media_type_str)
+        if match:
+            show_state["title"] = str(match.get("title") or show_state.get("title") or "").strip()
+            show_state["year"] = match.get("year") or show_state.get("year")
+            show_state["tmdb_id"] = match.get("tmdb_id") or show_state.get("tmdb_id")
+            if media_type_str != "电影":
+                try:
+                    show_state["season"] = int(match.get("season") or show_state.get("season") or 1)
+                except (TypeError, ValueError):
+                    show_state["season"] = 1
+                total_eps = match.get("_cache_total_episodes") or match.get("total_episodes")
+                try:
+                    total_eps = int(total_eps) if total_eps not in (None, "") else None
+                except (TypeError, ValueError):
+                    total_eps = None
+                if total_eps:
+                    show_state["total_episodes"] = total_eps
+
+        if not show_state.get("tmdb_id") or (media_type_str != "电影" and not show_state.get("total_episodes")):
+            subscription = {
+                "title": show_state.get("title") or show_name,
+                "tmdb_id": show_state.get("tmdb_id"),
+                "media_type": media_type_str,
+                "season": show_state.get("season") or 1,
+                "year": show_state.get("year"),
+            }
+            try:
+                _, mediainfo = self._build_notification_media_context(subscription, [1], show_name)
+            except Exception as e:
+                logger.debug(f"【CD2巡查】识别媒体信息失败 {show_name}: {e}")
+                mediainfo = None
+            if mediainfo:
+                tmdb_id = getattr(mediainfo, "tmdb_id", None)
+                try:
+                    tmdb_id = int(tmdb_id) if tmdb_id not in (None, "") else None
+                except (TypeError, ValueError):
+                    tmdb_id = None
+                if tmdb_id:
+                    show_state["tmdb_id"] = tmdb_id
+                media_title = getattr(mediainfo, "title", None) or getattr(mediainfo, "name", None)
+                if media_title:
+                    show_state["title"] = str(media_title).strip()
+                media_year = getattr(mediainfo, "year", None)
+                if media_year:
+                    show_state["year"] = media_year
+
+        if media_type_str != "电影" and show_state.get("tmdb_id") and not show_state.get("total_episodes"):
+            total_eps = self._get_total_episodes(
+                title=str(show_state.get("title") or show_name),
+                tmdb_id=show_state.get("tmdb_id"),
+                media_type_str=media_type_str,
+                season=show_state.get("season") or 1,
+            )
+            if total_eps:
+                show_state["total_episodes"] = total_eps
+
+        show_state["meta_updated_at"] = datetime.now().isoformat()
+        return show_state
+
+    def _refresh_cd2_watch_confirmed_map(
+        self,
+        show_state: dict,
+        show_name: str,
+        media_type_str: str,
+        seasons: List[int],
+    ) -> Dict[int, List[int]]:
+        confirmed = self._normalize_episode_map(show_state.get("confirmed_episodes_by_season"))
+        title = str(show_state.get("title") or self._strip_year(show_name) or show_name).strip()
+        tmdb_id = show_state.get("tmdb_id")
+
+        if media_type_str == "电影":
+            existing = self._get_existing_episodes(
+                title=title,
+                tmdb_id=tmdb_id,
+                media_type_str=media_type_str,
+                season=None,
+            )
+            if -1 in existing:
+                confirmed = {1: [-1]}
+        else:
+            for season in sorted({int(s) for s in seasons if s is not None} or {show_state.get("season") or 1}):
+                existing = self._get_existing_episodes(
+                    title=title,
+                    tmdb_id=tmdb_id,
+                    media_type_str=media_type_str,
+                    season=season,
+                )
+                if existing:
+                    confirmed[season] = sorted(set(confirmed.get(season, [])) | {int(ep) for ep in existing})
+
+        confirmed = self._normalize_episode_map(confirmed)
+        show_state["confirmed_episodes_by_season"] = confirmed
+        show_state["existing_count"] = self._episode_map_count(confirmed)
+        show_state["confirmed_updated_at"] = datetime.now().isoformat()
+        return confirmed
+
+    def _update_cd2_watch_completion_state(
+        self,
+        index: dict,
+        rule_state: dict,
+        show_state: dict,
+    ) -> None:
+        media_type_str = str(show_state.get("media_type") or "电视剧")
+        confirmed = self._normalize_episode_map(show_state.get("confirmed_episodes_by_season"))
+        total_eps = show_state.get("total_episodes")
+        try:
+            total_eps = int(total_eps) if total_eps not in (None, "") else None
+        except (TypeError, ValueError):
+            total_eps = None
+        existing_count = self._episode_map_count(confirmed)
+        show_state["existing_count"] = existing_count
+
+        completed_now = False
+        reason = ""
+        if media_type_str == "电影":
+            completed_now = -1 in set(confirmed.get(1, []))
+            if completed_now:
+                reason = "电影已入库"
+        elif total_eps and existing_count >= total_eps:
+            completed_now = True
+            reason = f"已有/总集数满足 ({existing_count}/{total_eps})"
+
+        if completed_now:
+            if not show_state.get("completed"):
+                completed_at = datetime.now().isoformat()
+                show_state["completed"] = True
+                show_state["completed_at"] = completed_at
+                show_state["completed_reason"] = reason
+                show_state["completion_key"] = (
+                    f"{rule_state.get('id')}|{show_state.get('show_key')}|{completed_at}"
+                )
+                self._append_cd2_watch_completed_show(index, rule_state, show_state, reason)
+            self._set_cd2_watch_pending_map(show_state, {})
+        else:
+            show_state["completed"] = False
+            show_state.pop("completed_at", None)
+            show_state.pop("completed_reason", None)
+            show_state.pop("completion_key", None)
 
     def _get_cd2_watch_notice_lock(self):
         lock = getattr(self, "_cd2_watch_notice_lock", None)
@@ -8797,12 +9216,16 @@ function startPolling() {
 
     def _build_cd2_watch_notice_records(
         self,
+        rule_id: str,
         rule_name: str,
+        show_key: str,
         show_name: str,
         dest_path: str,
         media_type_str: str,
         category: str,
         video_items_by_season: Dict[int, List[dict]],
+        tmdb_id: Optional[int] = None,
+        total_episodes: Optional[int] = None,
     ) -> List[dict]:
         title = self._strip_year(show_name) or show_name
         year = self._extract_year(show_name)
@@ -8815,10 +9238,14 @@ function startPolling() {
             if not movie_files:
                 return []
             records.append({
+                "rule_id": rule_id,
                 "rule_name": rule_name,
+                "show_key": show_key,
                 "raw_name": show_name,
                 "title": title,
                 "year": year,
+                "tmdb_id": tmdb_id,
+                "total_episodes": total_episodes,
                 "media_type": media_type_str,
                 "category": category,
                 "season": None,
@@ -8837,10 +9264,14 @@ function startPolling() {
                 if item.get("episode") is not None
             })
             records.append({
+                "rule_id": rule_id,
                 "rule_name": rule_name,
+                "show_key": show_key,
                 "raw_name": show_name,
                 "title": title,
                 "year": year,
+                "tmdb_id": tmdb_id,
+                "total_episodes": total_episodes,
                 "media_type": media_type_str,
                 "category": category,
                 "season": int(season or 1),
@@ -8931,6 +9362,41 @@ function startPolling() {
             "season": record.get("season") or 1,
             "year": record.get("year"),
         }
+
+    def _mark_cd2_watch_notice_confirmed(self, record: dict) -> None:
+        rule_id = str(record.get("rule_id") or "")
+        show_key = str(record.get("show_key") or "")
+        if not rule_id or not show_key:
+            return
+        index = self._load_cd2_watch_index()
+        rule_state = index.get("rules", {}).get(rule_id)
+        if not isinstance(rule_state, dict):
+            return
+        show_state = rule_state.get("shows", {}).get(show_key)
+        if not isinstance(show_state, dict):
+            return
+
+        media_type_str = str(record.get("media_type") or "电视剧")
+        confirmed = self._normalize_episode_map(show_state.get("confirmed_episodes_by_season"))
+        if media_type_str == "电影":
+            confirmed = {1: [-1]}
+        else:
+            season_num = int(record.get("season") or 1)
+            episodes = sorted({
+                int(ep)
+                for ep in (record.get("episodes") or [])
+                if ep is not None
+            })
+            if episodes:
+                confirmed[season_num] = sorted(set(confirmed.get(season_num, [])) | set(episodes))
+
+        show_state["confirmed_episodes_by_season"] = self._normalize_episode_map(confirmed)
+        show_state["confirmed_updated_at"] = datetime.now().isoformat()
+        pending = self._normalize_episode_map(show_state.get("pending_episodes_by_season"))
+        if pending:
+            self._set_cd2_watch_pending_map(show_state, self._episode_map_difference(pending, confirmed))
+        self._update_cd2_watch_completion_state(index, rule_state, show_state)
+        self._save_cd2_watch_index(index)
 
     def _is_cd2_watch_notice_confirmed(self, record: dict) -> bool:
         subscription = self._build_cd2_watch_subscription(record)
@@ -9028,6 +9494,7 @@ function startPolling() {
                 for notice in notices:
                     try:
                         if self._is_cd2_watch_notice_confirmed(notice):
+                            self._mark_cd2_watch_notice_confirmed(notice)
                             self._send_cd2_watch_notice_record(notice)
                             confirmed += 1
                         else:
@@ -9160,18 +9627,7 @@ function startPolling() {
         words = re.sub(r'[^a-zA-Z\s]', ' ', name).split()
         return ' '.join(words[:3]).lower()
 
-    def _find_matching_show_dir(self, cd2, dest_path: str, show_name: str) -> Optional[str]:
-        """
-        在 dest_path 下找与 show_name 最匹配的子目录。
-        匹配策略：中文子串匹配，无中文时英文词匹配。
-        返回匹配目录的完整路径，未找到返回 None。
-        """
-        try:
-            dest_items = cd2.list_dir(dest_path, force_refresh=True)
-        except Exception as e:
-            logger.warning(f"【CD2巡查】列出目标目录失败 {dest_path}: {e}")
-            return None
-
+    def _find_matching_show_dir_from_items(self, dest_items: List[dict], show_name: str) -> Optional[str]:
         src_key = self._extract_chinese_title(show_name)
         if not src_key:
             return None
@@ -9192,6 +9648,26 @@ function startPolling() {
                     best_path = item["path"]
 
         return best_path
+
+    def _find_matching_show_dir(
+        self,
+        cd2,
+        dest_path: str,
+        show_name: str,
+        dest_items: Optional[List[dict]] = None,
+    ) -> Optional[str]:
+        """
+        在 dest_path 下找与 show_name 最匹配的子目录。
+        匹配策略：中文子串匹配，无中文时英文词匹配。
+        返回匹配目录的完整路径，未找到返回 None。
+        """
+        if dest_items is None:
+            try:
+                dest_items = cd2.list_dir(dest_path, force_refresh=True)
+            except Exception as e:
+                logger.warning(f"【CD2巡查】列出目标目录失败 {dest_path}: {e}")
+                return None
+        return self._find_matching_show_dir_from_items(dest_items, show_name)
 
     def _get_dest_episodes_by_season(self, cd2, dest_show_path: str) -> Dict[int, set]:
         """递归扫描目标剧目录，返回 {季号: 已有集号集合}。"""
@@ -9237,18 +9713,69 @@ function startPolling() {
             eps |= season_eps
         return eps
 
-    def _sync_cd2_rule(self, rule: dict, cd2) -> dict:
+    def _build_source_episode_map(self, src_files_all: List[dict]) -> Tuple[List[dict], Dict[int, List[int]]]:
+        video_files = []
+        episodes_by_season: Dict[int, set] = {}
+        for item in src_files_all:
+            if item.get("is_dir"):
+                continue
+            ext = os.path.splitext(item.get("name", ""))[1].lower()
+            if ext not in self._video_extensions:
+                continue
+            video_files.append(item)
+            ep = self._parse_episode_number(item.get("name", ""))
+            if ep is None:
+                continue
+            season = self._infer_file_season(item)
+            episodes_by_season.setdefault(int(season or 1), set()).add(int(ep))
+        return video_files, {
+            int(season): sorted(values)
+            for season, values in episodes_by_season.items()
+            if values
+        }
+
+    def _collect_cd2_missing_files(
+        self,
+        src_files_all: List[dict],
+        missing_eps_by_season: Dict[int, List[int]],
+    ) -> Tuple[List[dict], List[dict]]:
+        missing_map = self._normalize_episode_map(missing_eps_by_season)
+        missing_videos = []
+        missing_all = []
+        for item in src_files_all:
+            if item.get("is_dir"):
+                continue
+            ext = os.path.splitext(item.get("name", ""))[1].lower()
+            ep = self._parse_episode_number(item.get("name", ""))
+            if ep is None:
+                continue
+            season = self._infer_file_season(item)
+            if ep not in set(missing_map.get(season, [])):
+                continue
+            if ext in self._video_extensions:
+                missing_videos.append(item)
+                missing_all.append(item)
+            elif ext in self._COMPANION_EXTENSIONS:
+                missing_all.append(item)
+        return missing_videos, missing_all
+
+    def _sync_cd2_rule(self, rule: dict, cd2, index: Optional[dict] = None,
+                       reconcile_target: bool = False) -> dict:
         """
         执行单条巡查规则：
-        - 列出源路径下的一级子目录（每个目录=一部剧）
-        - 对每部剧，在 dest_115_path 下找对应目录
-        - 比对集号差异，复制缺失文件
-        返回本次复制数量及后续待确认入库通知的记录。
+        - 递归读取源盘剧集目录
+        - 默认优先比较“本地巡查索引 + Plex/Emby/整理历史”判断缺失
+        - 仅在首次见到剧集或手动强制重建时，读取 115 目标目录做 bootstrap
+        - 复制真正缺失的剧集到 115 目标路径
         """
         source_path = rule.get("source_path", "").rstrip("/")
         dest_path = rule.get("dest_115_path", "").rstrip("/")
         rule_name = rule.get("name", source_path)
+        rule_id = self._cd2_watch_rule_key(rule)
         media_type_str, category = self._classify_cd2_watch_media(dest_path)
+        index = index or self._load_cd2_watch_index()
+        rule_state = self._get_cd2_watch_rule_state(index, rule)
+        show_states = rule_state.setdefault("shows", {})
 
         if not source_path or not dest_path:
             logger.warning(f"【CD2巡查】规则 {rule_name!r} 缺少路径配置，跳过")
@@ -9256,7 +9783,6 @@ function startPolling() {
 
         logger.info(f"【CD2巡查】开始巡查规则: {rule_name!r} | {source_path} → {dest_path}")
 
-        # 列出源目录（一级子目录，每个=一部剧）
         try:
             src_shows = cd2.list_dir(source_path, force_refresh=True)
         except Exception as e:
@@ -9264,56 +9790,133 @@ function startPolling() {
             return {"submitted_count": 0, "notice_records": []}
 
         src_show_dirs = [f for f in src_shows if f.get("is_dir")]
+        now_dt = datetime.now()
+        now_iso = now_dt.isoformat()
         if not src_show_dirs:
             logger.info(f"【CD2巡查】源目录为空: {source_path}")
+            rule_state["last_empty_at"] = now_iso
+            self._save_cd2_watch_index(index)
             return {"submitted_count": 0, "notice_records": []}
 
         total_copied = 0
         notice_records: List[dict] = []
+        active_show_keys = set()
+        dest_items_cache: Optional[List[dict]] = None
 
         for show in src_show_dirs:
             show_name = show["name"]
             show_path = show["path"]
+            show_key = self._cd2_watch_show_key(show_name, media_type_str)
+            active_show_keys.add(show_key)
 
-            # 列出源剧目录所有文件（含子目录）
+            show_state = show_states.get(show_key)
+            if not isinstance(show_state, dict):
+                show_state = {}
+            show_states[show_key] = show_state
+
+            show_state["show_key"] = show_key
+            show_state["show_name"] = show_name
+            show_state["source_path"] = show_path
+            show_state["dest_path"] = dest_path
+            show_state["rule_id"] = rule_id
+            show_state["rule_name"] = rule_name
+            show_state["media_type"] = media_type_str
+            show_state["category"] = category
+            show_state["last_seen_at"] = now_iso
+
             try:
                 src_files_all = self._list_recursive(cd2, show_path, force_refresh=True)
             except Exception as e:
                 logger.warning(f"【CD2巡查】列出源剧目录失败 {show_path}: {e}")
                 continue
 
-            # 找出视频文件，解析集号
-            src_video_files = [
-                f for f in src_files_all
-                if not f.get("is_dir") and
-                os.path.splitext(f["name"])[1].lower() in self._video_extensions
-            ]
+            src_video_files, source_eps_by_season = self._build_source_episode_map(src_files_all)
             if not src_video_files:
                 continue
 
-            # 在目标路径找对应剧目录
-            dest_show_path = self._find_matching_show_dir(cd2, dest_path, show_name)
-            show_notice_records: List[dict] = []
-            missing_by_dest: Dict[str, List[str]] = {}
+            old_source_eps = self._normalize_episode_map(show_state.get("source_episodes_by_season"))
+            source_changed = source_eps_by_season != old_source_eps
+            show_state["source_episodes_by_season"] = source_eps_by_season
+            show_state["source_count"] = (
+                len(src_video_files)
+                if media_type_str == "电影"
+                else self._episode_map_count(source_eps_by_season)
+            )
+            show_state["source_updated_at"] = now_iso
+            if source_changed:
+                show_state["last_source_change_at"] = now_iso
 
+            needs_meta = (
+                source_changed
+                or not show_state.get("meta_updated_at")
+                or not show_state.get("tmdb_id")
+                or (media_type_str != "电影" and not show_state.get("total_episodes"))
+            )
+            if needs_meta:
+                self._hydrate_cd2_watch_show_meta(show_state, show_name, media_type_str)
+
+            fresh_pending_map, stale_pending_map, pending_age = self._split_cd2_watch_pending_map(show_state)
+            if stale_pending_map:
+                stale_preview = sorted({ep for eps in stale_pending_map.values() for ep in eps})
+                logger.info(
+                    f"【CD2巡查】{show_name!r} 待确认副本已超时({pending_age}s)，允许重新后补: "
+                    f"{self._format_episode_preview(stale_preview)}"
+                )
+
+            seasons = sorted(source_eps_by_season.keys()) or [int(show_state.get("season") or 1)]
+            if source_changed or stale_pending_map or not show_state.get("confirmed_updated_at"):
+                confirmed_map = self._refresh_cd2_watch_confirmed_map(
+                    show_state=show_state,
+                    show_name=show_name,
+                    media_type_str=media_type_str,
+                    seasons=seasons,
+                )
+            else:
+                confirmed_map = self._normalize_episode_map(show_state.get("confirmed_episodes_by_season"))
+
+            # 电影：更保守，存在 fresh pending 或已确认入库时直接跳过。
             if media_type_str == "电影":
-                video_items_by_season: Dict[int, List[dict]] = {1: []}
-                if dest_show_path:
+                if -1 in set(confirmed_map.get(1, [])) or fresh_pending_map.get(1):
+                    self._update_cd2_watch_completion_state(index, rule_state, show_state)
+                    continue
+
+                dest_show_path = str(show_state.get("dest_show_path") or "")
+                if not dest_show_path:
+                    if dest_items_cache is None:
+                        try:
+                            dest_items_cache = cd2.list_dir(dest_path, force_refresh=True)
+                        except Exception as e:
+                            logger.warning(f"【CD2巡查】列出目标目录失败 {dest_path}: {e}")
+                            dest_items_cache = []
+                    dest_show_path = (
+                        self._find_matching_show_dir_from_items(dest_items_cache, show_name)
+                        or ""
+                    )
+                    if dest_show_path:
+                        show_state["dest_show_path"] = dest_show_path
+
+                if dest_show_path and (reconcile_target or not show_state.get("bootstrapped_target")):
                     try:
                         dest_movie_files = self._list_recursive(cd2, dest_show_path, force_refresh=True)
                     except Exception as e:
                         logger.warning(f"【CD2巡查】列出目标电影目录失败 {dest_show_path}: {e}")
                         dest_movie_files = []
-
                     dest_has_video = any(
                         not item.get("is_dir")
                         and os.path.splitext(item.get("name", ""))[1].lower() in self._video_extensions
                         for item in dest_movie_files
                     )
+                    show_state["bootstrapped_target"] = True
+                    show_state["last_target_bootstrap_at"] = now_iso
                     if dest_has_video:
-                        logger.info(f"【CD2巡查】{show_name!r} 目标已有视频文件，跳过电影复制")
+                        self._set_cd2_watch_pending_map(show_state, {1: [-1]}, now_dt)
+                        self._update_cd2_watch_completion_state(index, rule_state, show_state)
+                        logger.info(f"【CD2巡查】{show_name!r} 目标目录已有视频，先等待媒体库确认")
                         continue
 
+                video_items_by_season: Dict[int, List[dict]] = {1: []}
+                missing_by_dest: Dict[str, List[str]] = {}
+                if dest_show_path:
                     movie_file_paths = []
                     for file_item in src_files_all:
                         if file_item.get("is_dir"):
@@ -9329,12 +9932,13 @@ function startPolling() {
                                 "size": int(file_item.get("size", 0) or 0),
                                 "episode": None,
                             })
-
                     if not movie_file_paths:
+                        self._update_cd2_watch_completion_state(index, rule_state, show_state)
                         continue
                     missing_by_dest = {dest_show_path: movie_file_paths}
                 else:
                     target_show_path = str(PurePosixPath(dest_path) / show_name)
+                    show_state["dest_show_path"] = target_show_path
                     for file_item in src_video_files:
                         src_file_path = PurePosixPath(file_item["path"])
                         try:
@@ -9351,126 +9955,138 @@ function startPolling() {
                     logger.info(f"【CD2巡查】{show_name!r} 目标无对应目录，整体复制电影目录")
 
                 show_notice_records = self._build_cd2_watch_notice_records(
+                    rule_id=rule_id,
                     rule_name=rule_name,
+                    show_key=show_key,
                     show_name=show_name,
                     dest_path=dest_path,
                     media_type_str=media_type_str,
                     category=category,
                     video_items_by_season=video_items_by_season,
+                    tmdb_id=show_state.get("tmdb_id"),
+                    total_episodes=show_state.get("total_episodes"),
                 )
-            elif dest_show_path:
-                # 已有剧目录 → 增量对比
-                dest_eps_by_season = self._get_dest_episodes_by_season(cd2, dest_show_path)
-                logger.info(
-                    f"【CD2巡查】{show_name!r} 目标已有集数: "
-                    f"{ {season: sorted(eps) for season, eps in dest_eps_by_season.items()} }"
-                )
-
-                missing_video_files = []
-                missing_eps_by_season: Dict[int, set] = {}
-                for f in src_files_all:
-                    if f.get("is_dir"):
-                        continue
-                    ext = os.path.splitext(f["name"])[1].lower()
-                    if ext not in self._video_extensions:
-                        continue
-                    ep = self._parse_episode_number(f["name"])
-                    if ep is None:
-                        logger.debug(f"【CD2巡查】{show_name!r} 跳过无法解析集号的视频: {f['name']}")
-                        continue
-                    file_season = self._infer_file_season(f)
-                    if ep not in dest_eps_by_season.get(file_season, set()):
-                        missing_video_files.append(f)
-                        missing_eps_by_season.setdefault(file_season, set()).add(ep)
-
-                if not missing_video_files:
-                    logger.info(f"【CD2巡查】{show_name!r} 无缺失视频，跳过")
+            else:
+                if not source_changed and not stale_pending_map:
+                    self._update_cd2_watch_completion_state(index, rule_state, show_state)
                     continue
 
-                missing_files = list(missing_video_files)
-                for f in src_files_all:
-                    if f.get("is_dir"):
-                        continue
-                    ext = os.path.splitext(f["name"])[1].lower()
-                    if ext not in self._COMPANION_EXTENSIONS:
-                        continue
-                    ep = self._parse_episode_number(f["name"])
-                    if ep is None:
-                        continue
-                    file_season = self._infer_file_season(f)
-                    if ep in missing_eps_by_season.get(file_season, set()):
-                        missing_files.append(f)
+                dest_show_path = str(show_state.get("dest_show_path") or "")
+                if not dest_show_path:
+                    if dest_items_cache is None:
+                        try:
+                            dest_items_cache = cd2.list_dir(dest_path, force_refresh=True)
+                        except Exception as e:
+                            logger.warning(f"【CD2巡查】列出目标目录失败 {dest_path}: {e}")
+                            dest_items_cache = []
+                    dest_show_path = (
+                        self._find_matching_show_dir_from_items(dest_items_cache, show_name)
+                        or ""
+                    )
+                    if dest_show_path:
+                        show_state["dest_show_path"] = dest_show_path
 
-                season_dest_dirs: Dict[int, str] = {}
+                if dest_show_path and (reconcile_target or not show_state.get("bootstrapped_target")):
+                    bootstrap_map = self._get_dest_episodes_by_season(cd2, dest_show_path)
+                    bootstrap_pending = self._episode_map_difference(bootstrap_map, confirmed_map)
+                    merged_pending = self._episode_map_union(fresh_pending_map, bootstrap_pending)
+                    self._set_cd2_watch_pending_map(show_state, merged_pending, now_dt)
+                    fresh_pending_map, _, _ = self._split_cd2_watch_pending_map(show_state)
+                    show_state["bootstrapped_target"] = True
+                    show_state["last_target_bootstrap_at"] = now_iso
+                    if bootstrap_pending:
+                        logger.info(
+                            f"【CD2巡查】{show_name!r} 首次同步读取到 115 目标已有集数: "
+                            f"{ {season: eps for season, eps in bootstrap_pending.items()} }"
+                        )
+                elif not dest_show_path and not show_state.get("bootstrapped_target"):
+                    show_state["bootstrapped_target"] = True
+                    show_state["last_target_bootstrap_at"] = now_iso
+
+                covered_map = self._episode_map_union(confirmed_map, fresh_pending_map)
+                missing_eps_by_season = self._episode_map_difference(source_eps_by_season, covered_map)
+                if not missing_eps_by_season:
+                    self._set_cd2_watch_pending_map(show_state, fresh_pending_map)
+                    self._update_cd2_watch_completion_state(index, rule_state, show_state)
+                    logger.info(f"【CD2巡查】{show_name!r} 本轮源盘无新增缺失集数，跳过复制")
+                    continue
+
+                missing_video_files, missing_files = self._collect_cd2_missing_files(
+                    src_files_all=src_files_all,
+                    missing_eps_by_season=missing_eps_by_season,
+                )
+                if not missing_video_files:
+                    self._update_cd2_watch_completion_state(index, rule_state, show_state)
+                    logger.info(f"【CD2巡查】{show_name!r} 缺失集未找到可复制视频文件，跳过")
+                    continue
+
+                if not dest_show_path:
+                    target_show_path = str(PurePosixPath(dest_path) / show_name)
+                    if cd2.create_folder(dest_path, show_name):
+                        logger.info(f"【CD2巡查】{show_name!r} 首次发现，已创建目标剧目录")
+                    else:
+                        logger.warning(f"【CD2巡查】{show_name!r} 创建目标剧目录失败，后续复制可能失败")
+                    dest_show_path = target_show_path
+                    show_state["dest_show_path"] = dest_show_path
+
+                season_dir_paths = show_state.get("season_dir_paths")
+                if not isinstance(season_dir_paths, dict):
+                    season_dir_paths = {}
                 video_items_by_season: Dict[int, List[dict]] = {}
-                for f in missing_video_files:
-                    file_season = self._infer_file_season(f)
-                    copy_dest = season_dest_dirs.get(file_season)
+                missing_by_dest: Dict[str, List[str]] = {}
+                for file_item in missing_video_files:
+                    file_season = self._infer_file_season(file_item)
+                    copy_dest = str(
+                        season_dir_paths.get(str(file_season))
+                        or season_dir_paths.get(file_season)
+                        or ""
+                    )
                     if not copy_dest:
                         copy_dest = self._find_or_create_season_dir(cd2, dest_show_path, file_season)
-                        season_dest_dirs[file_season] = copy_dest
-                    target_file_path = str(PurePosixPath(copy_dest) / f["name"])
+                        season_dir_paths[str(file_season)] = copy_dest
+                    target_file_path = str(PurePosixPath(copy_dest) / file_item["name"])
                     video_items_by_season.setdefault(file_season, []).append({
-                        "name": f["name"],
+                        "name": file_item["name"],
                         "path": target_file_path,
-                        "size": int(f.get("size", 0) or 0),
-                        "episode": self._parse_episode_number(f["name"]),
+                        "size": int(file_item.get("size", 0) or 0),
+                        "episode": self._parse_episode_number(file_item["name"]),
                     })
 
-                for f in missing_files:
-                    file_season = self._infer_file_season(f)
-                    copy_dest = season_dest_dirs.get(file_season)
+                for file_item in missing_files:
+                    file_season = self._infer_file_season(file_item)
+                    copy_dest = str(
+                        season_dir_paths.get(str(file_season))
+                        or season_dir_paths.get(file_season)
+                        or ""
+                    )
                     if not copy_dest:
                         copy_dest = self._find_or_create_season_dir(cd2, dest_show_path, file_season)
-                        season_dest_dirs[file_season] = copy_dest
-                    missing_by_dest.setdefault(copy_dest, []).append(f["path"])
+                        season_dir_paths[str(file_season)] = copy_dest
+                    missing_by_dest.setdefault(copy_dest, []).append(file_item["path"])
 
+                show_state["season_dir_paths"] = season_dir_paths
                 ep_nums = sorted({
-                    self._parse_episode_number(f["name"])
-                    for f in missing_video_files
-                    if self._parse_episode_number(f["name"]) is not None
+                    self._parse_episode_number(item["name"])
+                    for item in missing_video_files
+                    if self._parse_episode_number(item["name"]) is not None
                 })
                 logger.info(
                     f"【CD2巡查】{show_name!r} 缺失 {len(missing_video_files)} 个视频"
                     f"（集号: {ep_nums}），连同伴随文件共 {len(missing_files)} 项，开始复制"
                 )
                 show_notice_records = self._build_cd2_watch_notice_records(
+                    rule_id=rule_id,
                     rule_name=rule_name,
+                    show_key=show_key,
                     show_name=show_name,
                     dest_path=dest_path,
                     media_type_str=media_type_str,
                     category=category,
                     video_items_by_season=video_items_by_season,
-                )
-            else:
-                # 目标没有此剧 → 整个目录复制
-                logger.info(f"【CD2巡查】{show_name!r} 目标无对应目录，整体复制")
-                missing_by_dest = {dest_path: [show_path]}
-                target_show_path = str(PurePosixPath(dest_path) / show_name)
-                video_items_by_season: Dict[int, List[dict]] = {}
-                for file_item in src_video_files:
-                    file_season = self._infer_file_season(file_item)
-                    src_file_path = PurePosixPath(file_item["path"])
-                    try:
-                        rel_path = src_file_path.relative_to(PurePosixPath(show_path))
-                    except Exception:
-                        rel_path = PurePosixPath(file_item["name"])
-                    video_items_by_season.setdefault(file_season, []).append({
-                        "name": file_item["name"],
-                        "path": str(PurePosixPath(target_show_path) / rel_path),
-                        "size": int(file_item.get("size", 0) or 0),
-                        "episode": self._parse_episode_number(file_item["name"]),
-                    })
-                show_notice_records = self._build_cd2_watch_notice_records(
-                    rule_name=rule_name,
-                    show_name=show_name,
-                    dest_path=dest_path,
-                    media_type_str=media_type_str,
-                    category=category,
-                    video_items_by_season=video_items_by_season,
+                    tmdb_id=show_state.get("tmdb_id"),
+                    total_episodes=show_state.get("total_episodes"),
                 )
 
-            # 执行复制
             successful_destinations = set()
             for copy_dest, missing_paths in missing_by_dest.items():
                 ok = cd2.copy_file(missing_paths, copy_dest)
@@ -9485,17 +10101,56 @@ function startPolling() {
                     logger.warning(f"【CD2巡查】{show_name!r} 复制提交失败: {copy_dest}")
 
             if not successful_destinations:
+                self._update_cd2_watch_completion_state(index, rule_state, show_state)
                 continue
 
-            if media_type_str == "电影" and not dest_show_path:
+            if media_type_str == "电影":
+                self._set_cd2_watch_pending_map(
+                    show_state,
+                    self._episode_map_union(fresh_pending_map, {1: [-1]}),
+                    now_dt,
+                )
                 notice_records.extend(show_notice_records)
+                self._update_cd2_watch_completion_state(index, rule_state, show_state)
                 continue
 
+            copied_pending: Dict[int, List[int]] = {}
             for record in show_notice_records:
                 target_path = str(record.get("target_path") or "")
                 target_parent = str(PurePosixPath(target_path).parent) if target_path else ""
                 if not target_parent or target_parent in successful_destinations or dest_path in successful_destinations:
                     notice_records.append(record)
+                    season_num = int(record.get("season") or 1)
+                    copied_pending.setdefault(season_num, [])
+                    copied_pending[season_num].extend(
+                        int(ep) for ep in (record.get("episodes") or []) if ep is not None
+                    )
+
+            if copied_pending:
+                copied_pending = self._normalize_episode_map(copied_pending)
+                self._set_cd2_watch_pending_map(
+                    show_state,
+                    self._episode_map_union(fresh_pending_map, copied_pending),
+                    now_dt,
+                )
+
+            self._update_cd2_watch_completion_state(index, rule_state, show_state)
+
+        for key, item in show_states.items():
+            if key in active_show_keys:
+                if isinstance(item, dict):
+                    item.pop("source_missing_since", None)
+                continue
+            if isinstance(item, dict) and not item.get("source_missing_since"):
+                item["source_missing_since"] = now_iso
+
+        rule_state["active_count"] = len(active_show_keys)
+        rule_state["completed_count"] = len([
+            item for item in show_states.values()
+            if isinstance(item, dict) and item.get("completed")
+        ])
+        rule_state["last_run_at"] = now_iso
+        self._save_cd2_watch_index(index)
 
         return {
             "submitted_count": total_copied,
@@ -9539,11 +10194,17 @@ function startPolling() {
         active_rules = [r for r in self._cd2_watch_rules if r.get("enabled", True)]
         logger.info(f"【CD2巡查】开始巡查，共 {len(active_rules)} 条规则")
 
+        index = self._load_cd2_watch_index()
         total = 0
         pending_notice_records: List[dict] = []
         for rule in active_rules:
             try:
-                result = self._sync_cd2_rule(rule, cd2)
+                result = self._sync_cd2_rule(
+                    rule,
+                    cd2,
+                    index=index,
+                    reconcile_target=bool(force),
+                )
                 if isinstance(result, dict):
                     total += int(result.get("submitted_count") or 0)
                     pending_notice_records.extend(result.get("notice_records") or [])
