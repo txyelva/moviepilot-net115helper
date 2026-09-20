@@ -26,6 +26,8 @@ COMMON_PARAMS = {"pr": "ucpro", "fr": "pc", "uc_param_str": ""}
 
 class QuarkClient:
     _cookie: str = ""
+    # 本次 save_shared_link 是否因「分享已失效/已取消」而失败，供上层拉黑死链
+    last_share_dead: bool = False
 
     @classmethod
     def set_cookie(cls, cookie: str) -> None:
@@ -69,6 +71,7 @@ class QuarkClient:
 
     @classmethod
     def save_shared_link(cls, share_url: str, share_pwd: str, target_folder_path: str) -> bool:
+        cls.last_share_dead = False
         cookie = cls._read_cookie()
         if not cookie:
             logger.warning("【QuarkClient】未配置夸克 Cookie")
@@ -171,9 +174,31 @@ class QuarkClient:
         )
         data = resp.json()
         if int(data.get("status", 0) or 0) != 200:
-            logger.warning(f"【QuarkClient】获取 stoken 失败: {data}")
+            if cls._is_dead_share(data):
+                # 分享已被取消/已失效：这是链接本身的终态，重试没有意义。
+                # 标记出来让上层拉黑，避免每轮反复请求同一个死链。
+                cls.last_share_dead = True
+                logger.info(
+                    f"【QuarkClient】分享已失效(code={data.get('code')}): {data.get('message')}"
+                )
+            else:
+                logger.warning(f"【QuarkClient】获取 stoken 失败: {data}")
             return ""
         return (data.get("data") or {}).get("stoken") or ""
+
+    @staticmethod
+    def _is_dead_share(data: dict) -> bool:
+        """夸克：41011 分享地址已失效 / 41012 好友已取消了分享。"""
+        if not isinstance(data, dict):
+            return False
+        try:
+            code = int(data.get("code") or 0)
+        except (TypeError, ValueError):
+            code = 0
+        if code in (41011, 41012):
+            return True
+        msg = str(data.get("message") or "")
+        return any(k in msg for k in ("取消了分享", "已失效", "不存在"))
 
     @classmethod
     def _list_share_recursive(cls, client: httpx.Client, pwd_id: str, stoken: str, pdir_fid: str, depth: int = 0) -> list:

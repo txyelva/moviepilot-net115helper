@@ -222,6 +222,53 @@ class CD2Client:
             _sys.stdout.write(f"【CD2】copy_file 异常: {e}\n"); _sys.stdout.flush()
             return False
 
+    def move_file(
+        self,
+        src_paths: List[str],
+        dest_path: str,
+        conflict_policy: str = "Rename",
+        move_across_clouds: bool = True,
+    ) -> List[str]:
+        """
+        移动文件/文件夹到目标目录。
+
+        :param src_paths: 源路径列表
+        :param dest_path: 目标目录路径
+        :param conflict_policy: Rename / Overwrite / Skip
+        :param move_across_clouds: 允许跨挂载点移动；115 待整理和正式库可能是不同 CD2 挂载根
+        :return: 移动后的路径列表；空列表表示失败
+        """
+        if not src_paths:
+            return []
+        try:
+            policy = getattr(
+                clouddrive_pb2.MoveFileRequest,
+                str(conflict_policy or "Rename"),
+                clouddrive_pb2.MoveFileRequest.Rename,
+            )
+            stub = self._get_stub()
+            req = clouddrive_pb2.MoveFileRequest(
+                theFilePaths=src_paths,
+                destPath=dest_path,
+                conflictPolicy=policy,
+                moveAcrossClouds=bool(move_across_clouds),
+            )
+            result = stub.MoveFile(req, metadata=self._meta(), timeout=60)
+            if result.success:
+                moved = list(result.resultFilePaths or [])
+                if not moved:
+                    moved = [
+                        f"{dest_path.rstrip('/')}/{os.path.basename(path.rstrip('/'))}"
+                        for path in src_paths
+                    ]
+                logger.info(f"【CD2Client】移动成功: {len(src_paths)} 项 -> {dest_path}")
+                return moved
+            logger.warning(f"【CD2Client】移动失败: {result.errorMessage!r}")
+            return []
+        except Exception as e:
+            logger.error(f"【CD2Client】move_file 异常: {e}")
+            return []
+
     def get_copy_tasks(self) -> List[dict]:
         """
         获取所有复制任务状态列表。
@@ -350,8 +397,22 @@ class CD2Client:
             return files
         except Exception as e:
             self._last_error = self._format_error(e)
-            logger.error(f"【CD2Client】list_dir 异常 ({path}): {self._last_error}")
+            if self._looks_like_missing_dir(self._last_error):
+                # WebDAV 挂载（如夸克经 AList）在目录不存在时不会返回 NOT_FOUND，
+                # 而是抛 "list response code not 207"。这是"路径不存在"而非故障，
+                # 按空目录处理即可，不该当 ERROR 刷屏。
+                logger.debug(f"【CD2Client】list_dir 目录不存在或为空 ({path}): {self._last_error}")
+            else:
+                logger.error(f"【CD2Client】list_dir 异常 ({path}): {self._last_error}")
             return []
+
+    @staticmethod
+    def _looks_like_missing_dir(err: str) -> bool:
+        """判断 CD2 报错是否等价于「路径不存在」。"""
+        text = str(err or "").lower()
+        if "not 207" in text or "code not 207" in text:
+            return True
+        return "not_found" in text or "notfound" in text
 
     def rename_file(self, path: str, new_name: str) -> bool:
         """
@@ -376,6 +437,80 @@ class CD2Client:
         except Exception as e:
             logger.error(f"【CD2Client】rename_file 异常 ({path}): {e}")
             return False
+
+    def write_file_bytes(self, parent_path: str, file_name: str, data: bytes, overwrite: bool = False) -> bool:
+        """
+        在 CloudDrive2 路径下写入小文件，适合 NFO/海报等元数据文件。
+        默认如果同名文件已存在则跳过，减少对云盘的写操作。
+        """
+        parent_path = str(parent_path or "").rstrip("/")
+        file_name = str(file_name or "").strip().strip("/")
+        if not parent_path or not file_name or data is None:
+            return False
+
+        target_path = f"{parent_path}/{file_name}"
+        try:
+            existing = self.list_dir(parent_path, force_refresh=False) or []
+            exists = any(not item.get("is_dir") and item.get("name") == file_name for item in existing)
+            if exists and not overwrite:
+                logger.debug(f"【CD2Client】文件已存在，跳过写入: {target_path}")
+                return True
+            if exists and overwrite:
+                self.delete_file(target_path)
+        except Exception:
+            pass
+
+        handle = None
+        try:
+            stub = self._get_stub()
+            created = stub.CreateFile(
+                clouddrive_pb2.CreateFileRequest(
+                    parentPath=parent_path,
+                    fileName=file_name,
+                ),
+                metadata=self._meta(),
+                timeout=30,
+            )
+            handle = created.fileHandle
+            if isinstance(data, bytes):
+                payload = data
+            elif isinstance(data, bytearray):
+                payload = bytes(data)
+            else:
+                payload = str(data).encode("utf-8")
+            result = stub.WriteToFile(
+                clouddrive_pb2.WriteFileRequest(
+                    fileHandle=handle,
+                    startPos=0,
+                    length=len(payload),
+                    buffer=bytes(payload),
+                    closeFile=True,
+                ),
+                metadata=self._meta(),
+                timeout=60,
+            )
+            ok = int(result.bytesWritten or 0) == len(payload)
+            if ok:
+                logger.info(f"【CD2Client】写入成功: {target_path}")
+            else:
+                logger.warning(
+                    f"【CD2Client】写入字节数不一致: {target_path}, "
+                    f"{result.bytesWritten}/{len(payload)}"
+                )
+            return ok
+        except Exception as e:
+            logger.warning(f"【CD2Client】write_file_bytes 异常 ({target_path}): {e}")
+            return False
+        finally:
+            if handle:
+                try:
+                    stub.CloseFile(
+                        clouddrive_pb2.CloseFileRequest(fileHandle=handle),
+                        metadata=self._meta(),
+                        timeout=10,
+                    )
+                except Exception:
+                    pass
 
     def delete_file(self, path: str) -> bool:
         """

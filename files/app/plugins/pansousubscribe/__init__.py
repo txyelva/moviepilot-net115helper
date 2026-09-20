@@ -343,8 +343,7 @@ class PanSouSubscribe(_PluginBase):
         if not self._enabled:
             return
 
-        pansou_url = getattr(settings, "PANSOU_URL", None)
-        if not pansou_url:
+        if not settings.PANSOU_URL:
             logger.warning("【网盘订阅】未配置 PANSOU_URL，跳过检查")
             return
 
@@ -584,24 +583,19 @@ class PanSouSubscribe(_PluginBase):
 
     def _search_pansou(self, keyword: str) -> List[dict]:
         """搜索 PanSou"""
-        pansou_url = getattr(settings, "PANSOU_URL", "")
-        if not pansou_url:
-            logger.warning("【网盘订阅】未配置 PANSOU_URL")
-            return []
-        pansou_url = pansou_url.rstrip("/")
+        pansou_url = settings.PANSOU_URL.rstrip("/")
         headers = {"Content-Type": "application/json"}
 
         # 认证
-        pansou_auth_user = getattr(settings, "PANSOU_AUTH_USER", None)
-        pansou_auth_pass = getattr(settings, "PANSOU_AUTH_PASS", None)
-        if pansou_auth_user and pansou_auth_pass:
+        if hasattr(settings, "PANSOU_AUTH_USER") and settings.PANSOU_AUTH_USER and \
+           hasattr(settings, "PANSOU_AUTH_PASS") and settings.PANSOU_AUTH_PASS:
             try:
                 with httpx.Client(timeout=10.0) as client:
                     auth_resp = client.post(
                         f"{pansou_url}/api/auth/login",
                         json={
-                            "username": pansou_auth_user,
-                            "password": pansou_auth_pass,
+                            "username": settings.PANSOU_AUTH_USER,
+                            "password": settings.PANSOU_AUTH_PASS,
                         },
                     )
                     token = auth_resp.json().get("token")

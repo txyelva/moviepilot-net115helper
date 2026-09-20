@@ -4,12 +4,14 @@
 提供：可视化配置表单、订阅管理详情页（含进度条）、自定义 API、定时任务、扫码登录。
 """
 
+import glob
 import json
 import os
 import re
 import sqlite3
 import time
 import threading as _threading_mod
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -92,10 +94,18 @@ class Net115Helper(_PluginBase):
     _batch_size: int = 3
     _batch_interval_minutes: int = 25
     _batch_direct_115_limit: int = 0
-    _batch_cd2_copy_limit: int = 1
+    _batch_cd2_copy_limit: int = 3
     _batch_fallback_cloud_limit: int = 1
     _rate_limit_cooldown_minutes: int = 60
+    # 追平已播出集数后跳过搜索（省风控/复制）
+    _airing_skip_enabled: bool = True
+    _airing_window_start_hour: int = 18
+    _airing_idle_probe_hours: int = 6
     _rate_limit_escalation_enabled: bool = True
+    _notice_same_title_window_minutes: int = 360
+    _notice_same_title_max: int = 2
+    _notice_global_window_minutes: int = 60
+    _notice_global_max: int = 8
     _cloud_types: List[str] = ["115"]
     _quality_keywords: List[str] = []
     _exclude_keywords: List[str] = ["预告", "花絮", "CAM", "枪版"]
@@ -109,12 +119,14 @@ class Net115Helper(_PluginBase):
     _PENDING_COPY_TTL_SECONDS = 50 * 60  # 待入库 pending 最多保留 50 分钟
     _115_COOLDOWN_SECONDS = 3600
     _FALLBACK_COPY_GUARD_SECONDS = 90 * 60
-    _FALLBACK_COPY_SUBMIT_LIMIT_PER_RUN = 1
+    _FALLBACK_COPY_SUBMIT_LIMIT_PER_RUN = 3
     _PRECISION_DIRECT_115_LIMIT_PER_RUN = 1
 
     # ───────── CD2 降级配置 ─────────
     _fallback_enabled: bool = False
     _fallback_clouds: List[str] = []          # ["阿里云盘", "123云盘", "夸克", "百度网盘"]
+    _fallback_cloud_priority: List[str] = []  # 执行顺序；只对已勾选的云盘生效
+    _FALLBACK_CLOUD_DEFAULT_PRIORITY = ["阿里云盘", "百度网盘", "123云盘", "夸克"]
     _cd2_host: str = ""
     _cd2_port: int = 19798
     _cd2_token: str = ""
@@ -137,11 +149,33 @@ class Net115Helper(_PluginBase):
     _cd2_target_old_movie_path: str = ""
     _cd2_target_ongoing_path: str = ""
     _cd2_target_archive_path: str = ""
+    # 115 在本容器内的实际挂载根目录（留空则按常见 CloudDrive 挂载位置自动探测）
+    _cd2_local_mount_115: str = ""
+    # 自动探测用的通用候选位置，仅含通用约定路径，不写死具体部署环境
+    _CD2_LOCAL_MOUNT_GLOBS = (
+        "/volume*/CloudDrive/CloudDrive/115",
+        "/volume*/CloudDrive/115",
+        "/CloudDrive/CloudDrive/115",
+        "/CloudDrive/115",
+        "/mnt/CloudDrive/115",
+    )
+
+    # ───────── 插件闭环整理配置 ─────────
+    _closed_loop_organize_enabled: bool = False
+    _closed_loop_scrape_metadata: bool = True
+    _closed_loop_movie_library_path: str = ""
+    _closed_loop_old_movie_library_path: str = ""
+    _closed_loop_ongoing_library_path: str = ""
+    _closed_loop_archive_library_path: str = ""
+    _CLOSED_LOOP_HISTORY_KEY = "closed_loop_organized_v1"
 
     # 视频文件扩展名
     _video_extensions = {
         ".mkv", ".mp4", ".avi", ".wmv", ".flv", ".mov", ".ts", ".m2ts",
         ".rmvb", ".rm", ".mpg", ".mpeg", ".vob", ".strm",
+    }
+    _ARCHIVE_EXTENSIONS = {
+        ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".iso",
     }
 
     # ───────── CD2 巡查同步配置 ─────────
@@ -149,6 +183,9 @@ class Net115Helper(_PluginBase):
     _cd2_watch_interval_minutes: int = 120
     _cd2_watch_rules: List[dict] = []   # [{id, enabled, name, source_path, dest_115_path}]
     _CD2_WATCH_NOTICE_TTL_SECONDS = 24 * 3600
+    _PLUGIN_NOTICE_SENT_KEY = "plugin_notice_sent_v1"
+    _PLUGIN_NOTICE_SENT_TTL_SECONDS = 7 * 24 * 3600
+    _PLUGIN_NOTICE_RATE_KEY = "plugin_notice_rate_v1"
     _CD2_WATCH_INDEX_DATA_KEY = "cd2_watch_index_v1"
     _CD2_WATCH_ARCHIVE_LIMIT = 200
 
@@ -217,6 +254,26 @@ class Net115Helper(_PluginBase):
         # ---- 通知 ----
         notify_value = config.get("notify", True)
         self._notify = True if notify_value is None else bool(notify_value)
+        try:
+            self._notice_same_title_window_minutes = max(
+                1, int(config.get("notice_same_title_window_minutes", 360))
+            )
+        except (TypeError, ValueError):
+            self._notice_same_title_window_minutes = 360
+        try:
+            self._notice_same_title_max = max(1, int(config.get("notice_same_title_max", 2)))
+        except (TypeError, ValueError):
+            self._notice_same_title_max = 2
+        try:
+            self._notice_global_window_minutes = max(
+                1, int(config.get("notice_global_window_minutes", 60))
+            )
+        except (TypeError, ValueError):
+            self._notice_global_window_minutes = 60
+        try:
+            self._notice_global_max = max(1, int(config.get("notice_global_max", 8)))
+        except (TypeError, ValueError):
+            self._notice_global_max = 8
         # ---- token 过期提醒节流（实例级，不跨实例共享）----
         if not hasattr(self, "_token_warn_times") or not isinstance(self._token_warn_times, dict):
             self._token_warn_times = {}
@@ -229,7 +286,8 @@ class Net115Helper(_PluginBase):
         except (TypeError, ValueError):
             raw_interval = 60
         self._interval_minutes = self._to_minutes(raw_interval, self._interval_unit)
-        self._batch_check_enabled = bool(config.get("batch_check_enabled", True))
+        batch_check_value = config.get("batch_check_enabled", True)
+        self._batch_check_enabled = True if batch_check_value is None else bool(batch_check_value)
         try:
             self._batch_size = max(1, int(config.get("batch_size", 3)))
         except (TypeError, ValueError):
@@ -243,9 +301,9 @@ class Net115Helper(_PluginBase):
         except (TypeError, ValueError):
             self._batch_direct_115_limit = 0
         try:
-            self._batch_cd2_copy_limit = max(0, int(config.get("batch_cd2_copy_limit", 1)))
+            self._batch_cd2_copy_limit = max(0, int(config.get("batch_cd2_copy_limit", 3)))
         except (TypeError, ValueError):
-            self._batch_cd2_copy_limit = 1
+            self._batch_cd2_copy_limit = 3
         try:
             self._batch_fallback_cloud_limit = max(1, int(config.get("batch_fallback_cloud_limit", 1)))
         except (TypeError, ValueError):
@@ -255,6 +313,15 @@ class Net115Helper(_PluginBase):
         except (TypeError, ValueError):
             self._rate_limit_cooldown_minutes = 60
         self._rate_limit_escalation_enabled = bool(config.get("rate_limit_escalation_enabled", True))
+        self._airing_skip_enabled = bool(config.get("airing_skip_enabled", True))
+        try:
+            self._airing_window_start_hour = min(23, max(0, int(config.get("airing_window_start_hour", 18))))
+        except (TypeError, ValueError):
+            self._airing_window_start_hour = 18
+        try:
+            self._airing_idle_probe_hours = max(0, int(config.get("airing_idle_probe_hours", 6)))
+        except (TypeError, ValueError):
+            self._airing_idle_probe_hours = 6
         self._115_COOLDOWN_SECONDS = self._rate_limit_cooldown_minutes * 60
         self._FALLBACK_COPY_SUBMIT_LIMIT_PER_RUN = self._batch_cd2_copy_limit
 
@@ -292,10 +359,17 @@ class Net115Helper(_PluginBase):
         # ---- CD2 降级配置 ----
         self._fallback_enabled = config.get("fallback_enabled", False)
         fb_clouds = config.get("fallback_clouds", [])
-        if isinstance(fb_clouds, str):
-            self._fallback_clouds = [c.strip() for c in fb_clouds.split(",") if c.strip()]
-        else:
-            self._fallback_clouds = fb_clouds or []
+        self._fallback_clouds = self._normalize_fallback_cloud_list(fb_clouds)
+        priority_value = config.get("fallback_cloud_priority", "")
+        self._fallback_cloud_priority = (
+            self._normalize_fallback_cloud_list(priority_value)
+            or list(self._FALLBACK_CLOUD_DEFAULT_PRIORITY)
+        )
+        if not priority_value:
+            config["fallback_cloud_priority"] = self._format_fallback_cloud_order(
+                self._fallback_cloud_priority
+            )
+            config_changed = True
         self._cd2_host = config.get("cd2_host", "")
         try:
             self._cd2_port = int(config.get("cd2_port", 19798))
@@ -328,6 +402,17 @@ class Net115Helper(_PluginBase):
         self._cd2_target_old_movie_path = str(config.get("cd2_target_old_movie_path", "") or "").strip()
         self._cd2_target_ongoing_path = str(config.get("cd2_target_ongoing_path", "") or "").strip()
         self._cd2_target_archive_path = str(config.get("cd2_target_archive_path", "") or "").strip()
+        self._cd2_local_mount_115 = str(config.get("cd2_local_mount_115", "") or "").strip()
+
+        # ---- 插件闭环整理配置 ----
+        closed_loop_value = config.get("closed_loop_organize_enabled", False)
+        self._closed_loop_organize_enabled = False if closed_loop_value is None else bool(closed_loop_value)
+        scrape_metadata_value = config.get("closed_loop_scrape_metadata", True)
+        self._closed_loop_scrape_metadata = True if scrape_metadata_value is None else bool(scrape_metadata_value)
+        self._closed_loop_movie_library_path = str(config.get("closed_loop_movie_library_path", "") or "").strip()
+        self._closed_loop_old_movie_library_path = str(config.get("closed_loop_old_movie_library_path", "") or "").strip()
+        self._closed_loop_ongoing_library_path = str(config.get("closed_loop_ongoing_library_path", "") or "").strip()
+        self._closed_loop_archive_library_path = str(config.get("closed_loop_archive_library_path", "") or "").strip()
 
         # ---- CD2 巡查同步配置 ----
         self._cd2_watch_enabled = config.get("cd2_watch_enabled", False)
@@ -674,6 +759,69 @@ class Net115Helper(_PluginBase):
         domain = re.sub(r"^https?://", "", domain).strip("/")
         return domain or "api.themoviedb.org"
 
+    @classmethod
+    def _normalize_fallback_cloud_name(cls, value: Any) -> str:
+        name = str(value or "").strip()
+        if not name:
+            return ""
+        compact = re.sub(r"\s+", "", name).lower()
+        aliases = {
+            "aliyun": "阿里云盘",
+            "ali": "阿里云盘",
+            "alipan": "阿里云盘",
+            "阿里": "阿里云盘",
+            "阿里云": "阿里云盘",
+            "阿里云盘": "阿里云盘",
+            "baidu": "百度网盘",
+            "百度": "百度网盘",
+            "百度云": "百度网盘",
+            "百度网盘": "百度网盘",
+            "quark": "夸克",
+            "kuake": "夸克",
+            "夸克": "夸克",
+            "夸克网盘": "夸克",
+            "123": "123云盘",
+            "123云盘": "123云盘",
+        }
+        return aliases.get(compact, name if name in cls._FALLBACK_CLOUD_DEFAULT_PRIORITY else "")
+
+    @classmethod
+    def _normalize_fallback_cloud_list(cls, value: Any) -> List[str]:
+        if isinstance(value, str):
+            raw_items = re.split(r"[,，、\s]+", value)
+        elif isinstance(value, (list, tuple, set)):
+            raw_items = list(value)
+        else:
+            raw_items = []
+
+        normalized = []
+        seen = set()
+        for item in raw_items:
+            cloud = cls._normalize_fallback_cloud_name(item)
+            if cloud and cloud not in seen:
+                normalized.append(cloud)
+                seen.add(cloud)
+        return normalized
+
+    @staticmethod
+    def _format_fallback_cloud_order(clouds: List[str]) -> str:
+        return ",".join([str(cloud).strip() for cloud in (clouds or []) if str(cloud).strip()])
+
+    def _get_effective_fallback_clouds(self) -> List[str]:
+        enabled = self._normalize_fallback_cloud_list(self._fallback_clouds)
+        if not enabled:
+            return []
+        enabled_set = set(enabled)
+        ordered_candidates = []
+        for cloud in (
+            self._normalize_fallback_cloud_list(self._fallback_cloud_priority)
+            + list(self._FALLBACK_CLOUD_DEFAULT_PRIORITY)
+            + enabled
+        ):
+            if cloud not in ordered_candidates:
+                ordered_candidates.append(cloud)
+        return [cloud for cloud in ordered_candidates if cloud in enabled_set]
+
     @staticmethod
     def _mask_secret(value: str) -> str:
         if not value:
@@ -746,6 +894,16 @@ class Net115Helper(_PluginBase):
                 "minutes": subscribe_interval,
             }
         }]
+        if self._closed_loop_organize_enabled:
+            services.append({
+                "id": "net115helper_pending_organize",
+                "name": "115待入库闭环整理",
+                "trigger": "interval",
+                "func": self._organize_pending_subscriptions,
+                "kwargs": {
+                    "minutes": 3,
+                }
+            })
         if self._cd2_watch_enabled and self._cd2_watch_rules:
             services.append({
                 "id": "net115helper_cd2_watch",
@@ -754,6 +912,15 @@ class Net115Helper(_PluginBase):
                 "func": self._run_cd2_watch,
                 "kwargs": {
                     "minutes": self._cd2_watch_interval_minutes,
+                }
+            })
+            services.append({
+                "id": "net115helper_cd2_watch_notice_confirm",
+                "name": "CD2巡查入库通知补偿确认",
+                "trigger": "interval",
+                "func": self._run_cd2_watch_notice_compensation,
+                "kwargs": {
+                    "minutes": 10,
                 }
             })
         services.append({
@@ -840,6 +1007,14 @@ class Net115Helper(_PluginBase):
                 "allow_anonymous": True,
                 "summary": "手动归档订阅",
                 "description": "将指定 TMDB ID 的订阅移入历史记录。参数: tmdb_id (必填), season (可选), reason (可选)",
+            },
+            {
+                "path": "/delete_history",
+                "endpoint": self.api_delete_history,
+                "methods": ["GET"],
+                "allow_anonymous": True,
+                "summary": "删除历史归档记录",
+                "description": "删除指定 TMDB ID 的历史归档记录，删除后可重新订阅。参数: tmdb_id (必填), season (可选)",
             },
             {
                 "path": "/add_sub",
@@ -1016,7 +1191,7 @@ class Net115Helper(_PluginBase):
         started = self._start_subscription_check_background("手动立即执行")
         if started:
             return {"success": True, "message": "115订阅巡检已在后台启动"}
-        return {"success": False, "message": "已有订阅巡检正在运行，请稍后再试"}
+        return {"success": True, "message": "已有订阅巡检正在运行，已排队补跑"}
 
     def api_organize_pending_now(self, tmdb_id: int = None, season: int = None):
         """API: 后台立即触发一次待入库文件整理"""
@@ -1112,12 +1287,12 @@ class Net115Helper(_PluginBase):
         if not rule["name"] or not rule["source_path"] or not rule["dest_115_path"]:
             return {"success": False, "message": "规则名称、源路径、115目标父目录都必须填写"}
         rules = list(self._cd2_watch_rules or [])
-        rule_id = rule.get("id")
+        rule_id = str(rule.get("id") or "").strip()
         if rule_id:
-            rule["id"] = str(rule_id)
+            rule["id"] = rule_id
             # 更新已有规则
             for i, r in enumerate(rules):
-                if r.get("id") == rule_id:
+                if str(r.get("id") or "") == rule_id or self._cd2_watch_rule_key(r) == rule_id:
                     rules[i] = rule
                     break
             else:
@@ -1131,15 +1306,69 @@ class Net115Helper(_PluginBase):
         self.update_config(config)
         return {"success": True, "message": "规则已保存", "data": rule}
 
-    def api_delete_watch_rule(self, id: str = None):
+    def api_delete_watch_rule(self, id: str = None, key: str = None):
         """API: 删除CD2巡查规则"""
-        if not id:
+        targets = {
+            str(value).strip()
+            for value in (id, key)
+            if str(value or "").strip()
+        }
+        if not targets:
             return {"success": False, "message": "缺少 id 参数"}
-        rules = [r for r in (self._cd2_watch_rules or []) if r.get("id") != id]
+
+        removed_rules = []
+        rules = []
+        for rule in (self._cd2_watch_rules or []):
+            candidates = {
+                str(rule.get("id") or "").strip(),
+                self._cd2_watch_rule_key(rule),
+            }
+            if candidates & targets:
+                removed_rules.append(rule)
+            else:
+                rules.append(rule)
+
+        if not removed_rules:
+            return {"success": False, "message": "未找到要删除的巡查规则"}
+
         self._cd2_watch_rules = rules
         config = self.get_config() or {}
         config["cd2_watch_rules"] = rules
         self.update_config(config)
+
+        cleanup_keys = set(targets)
+        for rule in removed_rules:
+            cleanup_keys.add(self._cd2_watch_rule_key(rule))
+            if rule.get("id"):
+                cleanup_keys.add(str(rule.get("id")))
+
+        try:
+            index = self._load_cd2_watch_index()
+            rule_states = index.get("rules")
+            if isinstance(rule_states, dict):
+                for rule_key in cleanup_keys:
+                    rule_states.pop(rule_key, None)
+            completed = index.get("completed")
+            if isinstance(completed, list):
+                index["completed"] = [
+                    item for item in completed
+                    if not isinstance(item, dict)
+                    or str(item.get("rule_id") or "") not in cleanup_keys
+                ]
+            self._save_cd2_watch_index(index)
+        except Exception as e:
+            logger.warning(f"【CD2巡查】删除规则后清理索引失败: {e}")
+
+        try:
+            notices = [
+                item for item in self._load_cd2_watch_pending_notices()
+                if not isinstance(item, dict)
+                or str(item.get("rule_id") or "") not in cleanup_keys
+            ]
+            self._save_cd2_watch_pending_notices(notices)
+        except Exception as e:
+            logger.warning(f"【CD2巡查】删除规则后清理待通知失败: {e}")
+
         return {"success": True, "message": "规则已删除"}
 
     def api_run_watch_now(self):
@@ -1181,6 +1410,9 @@ class Net115Helper(_PluginBase):
                     "pending_status": sub.get("pending_copy_status", ""),
                     "last_found_via": sub.get("last_found_via", ""),
                     "total_episodes": sub.get("_cache_total_episodes"),
+                    "aired_episodes": sub.get("_cache_aired_episodes"),
+                    "next_air_date": sub.get("_cache_next_air_date"),
+                    "last_search_at": sub.get("_last_search_at"),
                 })
             runtime = dict(self._load_runtime_state() or {})
             runtime.update({
@@ -1192,6 +1424,15 @@ class Net115Helper(_PluginBase):
                 "batch_fallback_cloud_limit": self._batch_fallback_cloud_limit,
                 "rate_limit_cooldown_minutes": self._rate_limit_cooldown_minutes,
                 "rate_limit_escalation_enabled": self._rate_limit_escalation_enabled,
+                "airing_skip_enabled": self._airing_skip_enabled,
+                "airing_window_start_hour": self._airing_window_start_hour,
+                "airing_idle_probe_hours": self._airing_idle_probe_hours,
+                "notice_same_title_window_minutes": self._notice_same_title_window_minutes,
+                "notice_same_title_max": self._notice_same_title_max,
+                "notice_global_window_minutes": self._notice_global_window_minutes,
+                "notice_global_max": self._notice_global_max,
+                "fallback_cloud_priority": self._format_fallback_cloud_order(self._fallback_cloud_priority),
+                "effective_fallback_clouds": self._get_effective_fallback_clouds(),
             })
             return {"success": True, "data": status_list, "runtime": runtime}
         except Exception as e:
@@ -1228,6 +1469,21 @@ class Net115Helper(_PluginBase):
                     "data": archived,
                 }
             return {"success": False, "message": f"未找到订阅 TMDB={tmdb_id}"}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def api_delete_history(self, tmdb_id: int = None, season: int = None):
+        """API: 删除历史归档记录（删除后可重新订阅）"""
+        try:
+            if not tmdb_id:
+                return {"success": False, "message": "需要提供 tmdb_id 参数"}
+            removed = self.delete_history(int(tmdb_id), int(season) if season else None)
+            if removed:
+                return {
+                    "success": True,
+                    "message": f"已删除 {removed} 条历史归档记录，现在可以重新订阅",
+                }
+            return {"success": False, "message": f"未找到历史归档 TMDB={tmdb_id}"}
         except Exception as e:
             return {"success": False, "message": str(e)}
 
@@ -1849,6 +2105,67 @@ function startPolling() {
                             },
                         ]
                     },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "notice_same_title_window_minutes",
+                                        "label": "同剧限频窗口（分钟）",
+                                        "type": "number",
+                                        "placeholder": "360",
+                                        "hint": "CD2 入库通知按剧名/TMDB 合并并限频；默认 6 小时。",
+                                        "persistent-hint": True,
+                                    }
+                                }]
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "notice_same_title_max",
+                                        "label": "同剧最多通知（次）",
+                                        "type": "number",
+                                        "placeholder": "2",
+                                    }
+                                }]
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "notice_global_window_minutes",
+                                        "label": "全局限频窗口（分钟）",
+                                        "type": "number",
+                                        "placeholder": "60",
+                                        "hint": "仅限制插件发出的入库通知，登录失效等告警不受影响。",
+                                        "persistent-hint": True,
+                                    }
+                                }]
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "notice_global_max",
+                                        "label": "全局最多通知（次）",
+                                        "type": "number",
+                                        "placeholder": "8",
+                                    }
+                                }]
+                            },
+                        ]
+                    },
                     # ── Cookie ──
                     {
                         "component": "VRow",
@@ -2016,7 +2333,7 @@ function startPolling() {
                                         "model": "batch_fallback_cloud_limit",
                                         "label": "每订阅备用盘尝试数",
                                         "type": "number",
-                                        "placeholder": "1",
+                                        "placeholder": "3",
                                     }
                                 }]
                             },
@@ -2049,6 +2366,54 @@ function startPolling() {
                                         "model": "rate_limit_escalation_enabled",
                                         "label": "连续风控自动加长静默",
                                         "hint": "两小时内连续触发时按 1倍/1.5倍/2倍退避",
+                                        "persistent-hint": True,
+                                    }
+                                }]
+                            },
+                        ]
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "airing_skip_enabled",
+                                        "label": "追平已播出集数后跳过搜索",
+                                        "hint": "按 TMDB 已播出集数而非总集数判断缺失，避免空搜未播出的集",
+                                        "persistent-hint": True,
+                                    }
+                                }]
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "airing_window_start_hour",
+                                        "label": "播出日积极抓取起点(时)",
+                                        "type": "number",
+                                        "placeholder": "18",
+                                        "hint": "排播日当天到点后，把当天这集也算进目标主动抓",
+                                        "persistent-hint": True,
+                                    }
+                                }]
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "airing_idle_probe_hours",
+                                        "label": "兜底探针间隔(小时)",
+                                        "type": "number",
+                                        "placeholder": "6",
+                                        "hint": "已追平时每隔多久仍放行一轮，兼容 TMDB 录入滞后；0=不放行",
                                         "persistent-hint": True,
                                     }
                                 }]
@@ -2761,12 +3126,33 @@ function startPolling() {
                                         ],
                                         "multiple": True,
                                         "chips": True,
-                                        "hint": "优先级按选择顺序，搜到即停止",
+                                        "hint": "这里只决定哪些云盘允许参与；实际先后顺序由下方优先级控制",
                                         "persistent-hint": True,
                                     }
                                 }]
                             },
                         ]
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [{
+                            "component": "VCol",
+                            "props": {"cols": 12},
+                            "content": [{
+                                "component": "VTextField",
+                                "props": {
+                                    "model": "fallback_cloud_priority",
+                                    "label": "降级优先级",
+                                    "placeholder": "阿里云盘,百度网盘,123云盘,夸克",
+                                    "hint": (
+                                        "逗号分隔，只对上方已勾选的云盘生效；"
+                                        "未写到但已勾选的云盘会按默认顺序排到后面。"
+                                        "夸克经由 AList/WebDAV 较慢，建议放最后兜底。"
+                                    ),
+                                    "persistent-hint": True,
+                                }
+                            }]
+                        }]
                     },
                     {
                         "component": "VRow",
@@ -2997,6 +3383,142 @@ function startPolling() {
                             },
                         ]
                     },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "cd2_local_mount_115",
+                                        "label": "115 在本容器内的挂载根目录（可选）",
+                                        "placeholder": "/CloudDrive/115",
+                                        "hint": "留空则自动探测常见 CloudDrive 挂载位置；多个用英文逗号分隔",
+                                        "persistent-hint": True,
+                                    }
+                                }]
+                            },
+                        ]
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [{
+                            "component": "VCol",
+                            "props": {"cols": 12},
+                            "content": [{
+                                "component": "VAlert",
+                                "props": {
+                                    "type": "warning",
+                                    "variant": "tonal",
+                                    "title": "插件闭环整理（试运行）",
+                                    "text": (
+                                        "打开后，115 助手会把待入库文件从上方 115 目标目录移动到正式媒体库，"
+                                        "并由插件完成重命名、基础 NFO/海报写入、Plex/Emby 局部刷新和入库通知。\n"
+                                        "跑通前不要删除 MoviePilot 本体的目录整理配置；未开启或未配置正式库目录时仍回退到 MP 原生整理。"
+                                    ),
+                                }
+                            }]
+                        }]
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [{
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "closed_loop_organize_enabled",
+                                        "label": "启用插件闭环整理",
+                                        "hint": "试运行开关；关闭时继续使用 MP 原生整理",
+                                        "persistent-hint": True,
+                                    }
+                                }]
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [{
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "closed_loop_scrape_metadata",
+                                        "label": "写入基础 NFO/海报",
+                                        "hint": "仅写剧集/季级 NFO 与海报，不写每集海报",
+                                        "persistent-hint": True,
+                                    }
+                                }]
+                            },
+                        ]
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "closed_loop_movie_library_path",
+                                        "label": "新电影正式库目录（CD2 路径）",
+                                        "placeholder": "/115影视库/电影/新电影",
+                                        "hint": "闭环整理移动到这里；留空则对应分类回退 MP 原生整理",
+                                        "persistent-hint": True,
+                                    }
+                                }]
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "closed_loop_old_movie_library_path",
+                                        "label": "老电影正式库目录（CD2 路径）",
+                                        "placeholder": "/115影视库/电影/老电影",
+                                        "hint": "分界年份之前电影的正式库目录",
+                                        "persistent-hint": True,
+                                    }
+                                }]
+                            },
+                        ]
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "closed_loop_ongoing_library_path",
+                                        "label": "连载剧正式库目录（CD2 路径）",
+                                        "placeholder": "/115影视库/电视剧/连载剧",
+                                        "hint": "闭环整理会创建 剧名 (年份)/Season 1",
+                                        "persistent-hint": True,
+                                    }
+                                }]
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "closed_loop_archive_library_path",
+                                        "label": "老剧/完结剧正式库目录（CD2 路径）",
+                                        "placeholder": "/115影视库/电视剧/完结剧",
+                                        "hint": "老剧或完结剧闭环整理目标目录",
+                                        "persistent-hint": True,
+                                    }
+                                }]
+                            },
+                        ]
+                    },
                     # ── CD2 巡查同步 ──
                     {
                         "component": "VRow",
@@ -3064,6 +3586,10 @@ function startPolling() {
             "cookie_source": "auto",
             "cookies": "",
             "notify": True,
+            "notice_same_title_window_minutes": 360,
+            "notice_same_title_max": 2,
+            "notice_global_window_minutes": 60,
+            "notice_global_max": 8,
             "default_cid": "0",
             "movie_staging_cid": "",
             "old_movie_staging_cid": "",
@@ -3081,9 +3607,12 @@ function startPolling() {
             "batch_size": 3,
             "batch_interval_minutes": 25,
             "batch_direct_115_limit": 0,
-            "batch_cd2_copy_limit": 1,
+            "batch_cd2_copy_limit": 3,
             "batch_fallback_cloud_limit": 1,
             "rate_limit_cooldown_minutes": 60,
+            "airing_skip_enabled": True,
+            "airing_window_start_hour": 18,
+            "airing_idle_probe_hours": 6,
             "rate_limit_escalation_enabled": True,
             "cloud_types": "115",
             "quality_keywords": "",
@@ -3099,6 +3628,7 @@ function startPolling() {
             # ── CD2 降级配置默认值 ──
             "fallback_enabled": False,
             "fallback_clouds": [],
+            "fallback_cloud_priority": "阿里云盘,百度网盘,123云盘,夸克",
             "cd2_host": "",
             "cd2_port": 19798,
             "cd2_token": "",
@@ -3116,6 +3646,14 @@ function startPolling() {
             "cd2_target_old_movie_path": "",
             "cd2_target_ongoing_path": "",
             "cd2_target_archive_path": "",
+            "cd2_local_mount_115": "",
+            # ── 插件闭环整理默认值 ──
+            "closed_loop_organize_enabled": False,
+            "closed_loop_scrape_metadata": True,
+            "closed_loop_movie_library_path": "",
+            "closed_loop_old_movie_library_path": "",
+            "closed_loop_ongoing_library_path": "",
+            "closed_loop_archive_library_path": "",
             # ── CD2 巡查同步默认值 ──
             "cd2_watch_enabled": False,
             "cd2_watch_interval_minutes": 120,
@@ -3408,6 +3946,7 @@ function startPolling() {
                 {"title": "类型", "key": "media_type"},
                 {"title": "完结原因", "key": "reason"},
                 {"title": "完结时间", "key": "completed_time"},
+                {"title": "操作", "key": "actions"},
             ]
             page.append({
                 "component": "VCard",
@@ -3469,19 +4008,13 @@ function startPolling() {
                                 {
                                     "component": "tbody",
                                     "content": [
-                                        {
-                                            "component": "tr",
-                                            "props": {
+                                        self._build_history_table_row(
+                                            row,
+                                            extra_props={
                                                 "data-net115-history-extra": "1",
-                                                "style": "display:none" if idx >= history_preview_limit else "",
-                                            } if idx >= history_preview_limit else {},
-                                            "content": [
-                                                {"component": "td", "text": row["title"]},
-                                                {"component": "td", "text": row["media_type"]},
-                                                {"component": "td", "text": row["reason"]},
-                                                {"component": "td", "text": row["completed_time"]},
-                                            ]
-                                        }
+                                                "style": "display:none",
+                                            } if idx >= history_preview_limit else None,
+                                        )
                                         for idx, row in enumerate(history_rows)
                                     ]
                                 },
@@ -3644,10 +4177,13 @@ function startPolling() {
         )
         error_msg_js = "(d.message||d.detail||d.error||JSON.stringify(d))"
 
-        # ── 已有规则列表 ──
-        rule_rows = []
+        # ── 已有规则列表：使用响应式卡片，避免手机竖屏横向表格把操作按钮挤出屏幕 ──
+        rule_cards = []
+        path_text_style = "word-break:break-all;white-space:normal;line-height:1.45;"
+        action_style = "display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;"
         for rule in rules:
-            rule_id = rule.get("id", "")
+            rule_key = self._cd2_watch_rule_key(rule)
+            rule_id = str(rule.get("id") or rule_key)
             enabled = rule.get("enabled", True)
             rule_name = rule.get("name", "")
             delete_confirm = json.dumps(f"确定删除规则「{rule_name}」？", ensure_ascii=False)
@@ -3661,7 +4197,8 @@ function startPolling() {
             delete_js = (
                 f"if(confirm({delete_confirm})){{"
                 f"{auth_js}"
-                f"fetch('/api/v1/plugin/Net115Helper/delete_watch_rule?id='+encodeURIComponent({json.dumps(rule_id)}),"
+                f"fetch('/api/v1/plugin/Net115Helper/delete_watch_rule?id='+encodeURIComponent({json.dumps(rule_id)})"
+                f"+'&key='+encodeURIComponent({json.dumps(rule_key)}),"
                 "{headers:h,credentials:'include'})"
                 f"{parse_json_js}"
                 ".then(function(d){if(d._ok&&d.success){alert(d.message||'规则已删除');location.reload();}"
@@ -3679,63 +4216,106 @@ function startPolling() {
                 f"else{{alert('操作失败: '+{error_msg_js});}}}})"
                 ".catch(function(e){alert('请求失败: '+e);})"
             )
-            rule_rows.append({
-                "component": "tr",
-                "content": [
-                    {"component": "td", "text": rule.get("name", "")},
-                    {"component": "td", "text": rule.get("source_path", "")},
-                    {"component": "td", "text": rule.get("dest_115_path", "")},
-                    {
-                        "component": "td",
-                        "content": [{
-                            "component": "VChip",
-                            "props": {
-                                "color": "success" if enabled else "default",
-                                "size": "x-small",
-                                "variant": "tonal",
-                                "style": "cursor:pointer",
-                                "onclick": toggle_js,
+            rule_cards.append({
+                "component": "VCard",
+                "props": {
+                    "variant": "outlined",
+                    "class": "mb-2",
+                },
+                "content": [{
+                    "component": "VCardText",
+                    "props": {"class": "py-3"},
+                    "content": [{
+                        "component": "VRow",
+                        "props": {"class": "align-center"},
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "div",
+                                        "props": {
+                                            "class": "text-subtitle-2 font-weight-medium",
+                                            "style": path_text_style,
+                                        },
+                                        "text": rule_name or "未命名规则",
+                                    },
+                                    {
+                                        "component": "VChip",
+                                        "props": {
+                                            "color": "success" if enabled else "default",
+                                            "size": "x-small",
+                                            "variant": "tonal",
+                                            "class": "mt-1",
+                                        },
+                                        "text": "启用中" if enabled else "已停用",
+                                    },
+                                ],
                             },
-                            "text": "启用中" if enabled else "已停用",
-                        }]
-                    },
-                    {
-                        "component": "td",
-                        "content": [{
-                            "component": "VBtn",
-                            "props": {
-                                "icon": "mdi-delete",
-                                "size": "x-small",
-                                "color": "error",
-                                "variant": "text",
-                                "onclick": delete_js,
-                            }
-                        }]
-                    },
-                ]
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-1"}, "text": "源路径（CD2）"},
+                                    {
+                                        "component": "div",
+                                        "props": {"class": "text-body-2", "style": path_text_style},
+                                        "text": rule.get("source_path", ""),
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-1"}, "text": "115 目标父目录"},
+                                    {
+                                        "component": "div",
+                                        "props": {"class": "text-body-2", "style": path_text_style},
+                                        "text": rule.get("dest_115_path", ""),
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 2, "style": action_style},
+                                "content": [
+                                    {
+                                        "component": "VBtn",
+                                        "props": {
+                                            "color": "success" if not enabled else "warning",
+                                            "size": "small",
+                                            "variant": "tonal",
+                                            "prepend-icon": "mdi-play-circle-outline" if not enabled else "mdi-pause-circle-outline",
+                                            "onclick": toggle_js,
+                                        },
+                                        "text": "启用" if not enabled else "停用",
+                                    },
+                                    {
+                                        "component": "VBtn",
+                                        "props": {
+                                            "color": "error",
+                                            "size": "small",
+                                            "variant": "tonal",
+                                            "prepend-icon": "mdi-delete-outline",
+                                            "onclick": delete_js,
+                                        },
+                                        "text": "删除",
+                                    },
+                                ],
+                            },
+                        ],
+                    }],
+                }],
             })
 
-        # ── 已有规则表格 ──
-        if rule_rows:
+        # ── 已有规则 ──
+        if rule_cards:
             rules_table = {
-                "component": "VTable",
-                "props": {"density": "compact", "class": "mb-4"},
-                "content": [
-                    {
-                        "component": "thead",
-                        "content": [{
-                            "component": "tr",
-                            "content": [
-                                {"component": "th", "props": {"class": "text-start"}, "text": "规则名"},
-                                {"component": "th", "props": {"class": "text-start"}, "text": "源路径（CD2）"},
-                                {"component": "th", "props": {"class": "text-start"}, "text": "115目标父目录"},
-                                {"component": "th", "props": {"class": "text-start"}, "text": "状态"},
-                                {"component": "th", "props": {"class": "text-start"}, "text": "操作"},
-                            ]
-                        }]
-                    },
-                    {"component": "tbody", "content": rule_rows},
-                ]
+                "component": "div",
+                "props": {"class": "mb-4"},
+                "content": rule_cards,
             }
         else:
             rules_table = {
@@ -3827,6 +4407,7 @@ function startPolling() {
                             "color": "primary",
                             "variant": "elevated",
                             "prepend-icon": "mdi-plus",
+                            "style": "min-width:120px;",
                             "onclick": add_js,
                         },
                         "text": "保存新规则",
@@ -3854,12 +4435,22 @@ function startPolling() {
             "content": [
                 {
                     "component": "VCardTitle",
-                    "props": {"class": "d-flex align-center justify-space-between"},
+                    "props": {
+                        "class": "d-flex align-center justify-space-between",
+                        "style": "flex-wrap:wrap;gap:8px;",
+                    },
                     "content": [
-                        {"component": "span", "text": f"CD2 云盘巡查同步（{len(rules)} 条规则）"},
+                        {
+                            "component": "span",
+                            "props": {"style": "white-space:normal;line-height:1.35;"},
+                            "text": f"CD2 云盘巡查同步（{len(rules)} 条规则）",
+                        },
                         {
                             "component": "div",
-                            "props": {"class": "d-flex ga-2"},
+                            "props": {
+                                "class": "d-flex ga-2",
+                                "style": "flex-wrap:wrap;",
+                            },
                             "content": [
                                 {
                                     "component": "VBtn",
@@ -3931,6 +4522,8 @@ function startPolling() {
 
             rows.append({
                 "title": sub.get("title", ""),
+                "tmdb_id": sub.get("tmdb_id"),
+                "season": sub.get("season"),
                 "media_type": sub.get("media_type", "电视剧"),
                 "reason": sub.get("completed_reason", "自动完结"),
                 "completed_time": completed_time or "未知",
@@ -4275,6 +4868,69 @@ function startPolling() {
         return rows
 
     @staticmethod
+    def _build_history_table_row(row: dict, extra_props: Optional[dict] = None) -> dict:
+        """为单条历史归档构建一个 <tr>，附删除按钮（删除归档后可重新订阅）"""
+        tmdb_id = str(row.get("tmdb_id") or "")
+        raw_season = row.get("season")
+        season_js = ""
+        if raw_season not in (None, "", "-"):
+            season_js = f"+'&season='+encodeURIComponent({json.dumps(str(raw_season), ensure_ascii=False)})"
+        confirm_text = json.dumps(
+            f"确定删除「{row.get('title') or tmdb_id}」的完结归档记录？删除后可重新订阅该剧。",
+            ensure_ascii=False,
+        )
+        auth_js = (
+            "var t=localStorage.getItem('token')||localStorage.getItem('access_token')||'';"
+            "var h={};"
+            "if(t){h['Authorization']='Bearer '+t;}"
+        )
+        parse_json_js = (
+            ".then(function(r){"
+            "return r.json().then(function(d){d._ok=r.ok;return d;})"
+            ".catch(function(){return {_ok:r.ok,message:r.status+' '+r.statusText};});"
+            "})"
+        )
+        delete_js = (
+            f"if(confirm({confirm_text})){{"
+            f"{auth_js}"
+            "fetch('/api/v1/plugin/Net115Helper/delete_history?tmdb_id='+encodeURIComponent("
+            f"{json.dumps(tmdb_id, ensure_ascii=False)})"
+            f"{season_js},"
+            "{headers:h,credentials:'include'})"
+            f"{parse_json_js}"
+            ".then(function(d){if(d._ok&&d.success){alert(d.message||'已删除');location.reload();}"
+            "else{alert('删除失败: '+(d.message||d.detail||d.error||JSON.stringify(d)));}})"
+            ".catch(function(e){alert('请求失败: '+e);})}"
+        )
+        tr = {
+            "component": "tr",
+            "content": [
+                {"component": "td", "text": row["title"]},
+                {"component": "td", "text": row["media_type"]},
+                {"component": "td", "text": row["reason"]},
+                {"component": "td", "text": row["completed_time"]},
+                {
+                    "component": "td",
+                    "content": [{
+                        "component": "VBtn",
+                        "props": {
+                            "size": "x-small",
+                            "color": "error",
+                            "variant": "tonal",
+                            "prepend-icon": "mdi-delete-outline",
+                            "disabled": not bool(tmdb_id),
+                            "onclick": delete_js,
+                        },
+                        "text": "删除",
+                    }]
+                },
+            ]
+        }
+        if extra_props:
+            tr["props"] = extra_props
+        return tr
+
+    @staticmethod
     def _build_table_row(row: dict) -> dict:
         """为单条订阅构建一个 <tr> Vuetify 组件"""
         tmdb_id = str(row.get("tmdb_id") or "")
@@ -4425,6 +5081,14 @@ function startPolling() {
             "cd2_target_old_movie_path": self._cd2_target_old_movie_path,
             "cd2_target_ongoing_path": self._cd2_target_ongoing_path,
             "cd2_target_archive_path": self._cd2_target_archive_path,
+            "fallback_clouds": self._fallback_clouds,
+            "fallback_cloud_priority": self._format_fallback_cloud_order(self._fallback_cloud_priority),
+            "effective_fallback_clouds": self._get_effective_fallback_clouds(),
+            "closed_loop_organize_enabled": self._closed_loop_organize_enabled,
+            "closed_loop_movie_library_path": self._closed_loop_movie_library_path,
+            "closed_loop_old_movie_library_path": self._closed_loop_old_movie_library_path,
+            "closed_loop_ongoing_library_path": self._closed_loop_ongoing_library_path,
+            "closed_loop_archive_library_path": self._closed_loop_archive_library_path,
         }
 
     # ================================================================
@@ -4433,8 +5097,13 @@ function startPolling() {
 
     def _get_total_episodes(self, title: str, tmdb_id: Optional[int],
                             media_type_str: str,
-                            season: Optional[int]) -> Optional[int]:
-        """从 TMDB 查询某季的总集数"""
+                            season: Optional[int],
+                            meta_out: Optional[dict] = None) -> Optional[int]:
+        """从 TMDB 查询某季的总集数
+
+        meta_out: 可选 dict，成功识别媒体后回填播出状态
+        (fetched/status/next_episode_to_air)，供在播保护判断使用。
+        """
         if not tmdb_id or media_type_str == "电影":
             return None
         target_season = season or 1
@@ -4453,6 +5122,66 @@ function startPolling() {
 
             if tmdb_id and mediainfo.tmdb_id != tmdb_id:
                 mediainfo.tmdb_id = tmdb_id
+
+            if meta_out is not None:
+                meta_out["fetched"] = True
+                tmdb_info_for_status = getattr(mediainfo, "tmdb_info", None)
+                status_val = None
+                next_ep_val = None
+                if isinstance(tmdb_info_for_status, dict):
+                    status_val = tmdb_info_for_status.get("status")
+                    next_ep_val = tmdb_info_for_status.get("next_episode_to_air")
+                elif tmdb_info_for_status is not None:
+                    status_val = getattr(tmdb_info_for_status, "status", None)
+                    next_ep_val = getattr(tmdb_info_for_status, "next_episode_to_air", None)
+                if not status_val:
+                    status_val = getattr(mediainfo, "status", None)
+                if next_ep_val in (None, ""):
+                    next_ep_val = getattr(mediainfo, "next_episode_to_air", None)
+                meta_out["status"] = str(status_val).strip() if status_val else ""
+                meta_out["next_episode_to_air"] = next_ep_val
+
+                # 已播出集数 / 下一集排播日：用于「追平已播出进度后跳过搜索」
+                last_ep_val = None
+                if isinstance(tmdb_info_for_status, dict):
+                    last_ep_val = tmdb_info_for_status.get("last_episode_to_air")
+                elif tmdb_info_for_status is not None:
+                    last_ep_val = getattr(tmdb_info_for_status, "last_episode_to_air", None)
+                if last_ep_val in (None, ""):
+                    last_ep_val = getattr(mediainfo, "last_episode_to_air", None)
+
+                def _pick(obj, key):
+                    if isinstance(obj, dict):
+                        return obj.get(key)
+                    return getattr(obj, key, None)
+
+                # 多季剧：last_episode_to_air 的集号是相对它自己那一季的，
+                # 季号对不上时不能拿来当本季的已播出集数。
+                aired_eps = None
+                last_season = _pick(last_ep_val, "season_number") if last_ep_val else None
+                if last_ep_val is not None:
+                    try:
+                        if last_season is None or int(last_season) == int(target_season):
+                            aired_eps = int(_pick(last_ep_val, "episode_number"))
+                    except (TypeError, ValueError):
+                        aired_eps = None
+                meta_out["aired_episodes"] = aired_eps
+
+                next_air_date = None
+                if next_ep_val is not None:
+                    next_season = _pick(next_ep_val, "season_number")
+                    try:
+                        same_season = next_season is None or int(next_season) == int(target_season)
+                    except (TypeError, ValueError):
+                        same_season = False
+                    if same_season:
+                        nd = _pick(next_ep_val, "air_date")
+                        next_air_date = str(nd).strip() if nd else None
+                meta_out["next_air_date"] = next_air_date
+                logger.info(
+                    f"【115助手】TMDB {title} S{target_season}: 播出状态={meta_out['status'] or '未知'}, "
+                    f"已播出={aired_eps}, 下一集排播日={next_air_date or '无'}"
+                )
 
             # 打印可用的属性，便于调试
             attrs_debug = []
@@ -4535,6 +5264,132 @@ function startPolling() {
             logger.warning(f"【115助手】查询 TMDB 总集数失败 (title={title}, tmdb_id={tmdb_id}): {e}")
         return None
 
+    @staticmethod
+    def _total_episodes_trustworthy(sub: dict) -> bool:
+        """
+        TMDB 的本季总集数是否可信（是否登记了尚未播出的集）。
+
+        `总集数 > 已播出集数` 说明 TMDB 已经排好了完整排播表，总集数是真实季长度；
+        `总集数 == 已播出集数` 时，「总集数」很可能只是「目前播了几集」——新剧开播
+        当天就是这种情况（藏锋 1/1 被误判完结归档即源于此），此时不可当作季长度。
+        """
+        try:
+            total = int(sub.get("_cache_total_episodes") or 0)
+            aired = int(sub.get("_cache_aired_episodes") or 0)
+        except (TypeError, ValueError):
+            return False
+        return total > aired > 0
+
+    @classmethod
+    def _should_allow_auto_complete(cls, sub: dict) -> bool:
+        """
+        在播保护：避免把 TMDB 集数滞后的在播新剧误判成全集完结。
+
+        允许归档的两种情况：
+          1) TMDB 明确标记 Ended/Canceled；
+          2) 总集数可信（见 _total_episodes_trustworthy）且已入库覆盖了全部集数——
+             此时资源已抢先于播出拿全，没有可再抓的内容，继续挂着只是空耗。
+        状态取不到时维持原行为（允许归档），避免影响老剧/完结剧归档链路。
+        """
+        status = str(sub.get("_cache_tmdb_status") or "").strip().lower()
+        if status in ("ended", "canceled", "cancelled"):
+            return True
+
+        if cls._total_episodes_trustworthy(sub):
+            try:
+                total = int(sub.get("_cache_total_episodes") or 0)
+            except (TypeError, ValueError):
+                total = 0
+            existing = set()
+            for ep in sub.get("_cache_existing_episodes") or []:
+                try:
+                    existing.add(int(ep))
+                except (TypeError, ValueError):
+                    continue
+            if total > 0 and not (set(range(1, total + 1)) - existing):
+                return True
+
+        if sub.get("_cache_has_next_episode"):
+            return False
+        if status:
+            # Returning Series / In Production / Planned / Pilot 等：仍在播出或制作
+            return False
+        return True
+
+    def _airing_effective_target(self, sub: dict, total_eps: Optional[int],
+                                 now: Optional[datetime] = None) -> Optional[int]:
+        """
+        本轮真正应该追到第几集。返回 None 表示 TMDB 数据不足，不启用跳过。
+
+        基准是 TMDB 的「已播出集数」而不是「本季总集数」——总集数含未播出的集，
+        拿它算缺失会让插件每轮都去搜根本还没播的集。
+        国产剧当天新集一般 18:00 后放出，而 TMDB 的 last_episode_to_air 往往滞后，
+        所以在「排播日当天且已过窗口起点」时把今天这集也算进目标（时间闸门内的 +1，
+        不是无条件冗余；无条件冗余会让跳过条件永远不成立）。
+        """
+        aired = sub.get("_cache_aired_episodes")
+        try:
+            aired = int(aired) if aired not in (None, "") else None
+        except (TypeError, ValueError):
+            aired = None
+        if not aired or aired <= 0:
+            return None
+
+        now = now or datetime.now()
+        target = aired
+        next_air_date = str(sub.get("_cache_next_air_date") or "").strip()
+        if next_air_date == now.strftime("%Y-%m-%d") and now.hour >= self._airing_window_start_hour:
+            target = aired + 1
+
+        if total_eps:
+            try:
+                target = min(target, int(total_eps))
+            except (TypeError, ValueError):
+                pass
+        return target
+
+    def _should_skip_airing_search(self, sub: dict, existing_episodes: List[int],
+                                   total_eps: Optional[int],
+                                   now: Optional[datetime] = None) -> Tuple[bool, str]:
+        """
+        已追平当前已播出进度时跳过本轮搜索/降级，返回 (是否跳过, 说明)。
+
+        为兼容 TMDB 录入滞后，仍保留一个低频兜底探针：距上次实际搜索超过
+        配置小时数时放行一轮。probe 小时数设为 0 表示不放行（完全按 TMDB 走）。
+        """
+        if not self._airing_skip_enabled:
+            return False, ""
+        if sub.get("media_type", "电视剧") == "电影":
+            return False, ""
+
+        target = self._airing_effective_target(sub, total_eps, now=now)
+        if target is None:
+            return False, ""
+
+        existing_set = set()
+        for ep in existing_episodes or []:
+            try:
+                existing_set.add(int(ep))
+            except (TypeError, ValueError):
+                continue
+        if set(range(1, target + 1)) - existing_set:
+            # 还有已播出但没入库的集，正常搜索
+            return False, ""
+
+        now = now or datetime.now()
+        if self._airing_idle_probe_hours > 0:
+            last_search = self._parse_iso_datetime(sub.get("_last_search_at"))
+            if not last_search:
+                return False, ""
+            idle_hours = (now - last_search).total_seconds() / 3600.0
+            if idle_hours >= self._airing_idle_probe_hours:
+                return False, ""
+            return True, (
+                f"已追平已播出进度（已入库覆盖 1-{target} 集），"
+                f"距上次搜索 {idle_hours:.1f} 小时未到 {self._airing_idle_probe_hours} 小时探针间隔"
+            )
+        return True, f"已追平已播出进度（已入库覆盖 1-{target} 集）"
+
     # ================================================================
     #  核心订阅检查逻辑（来自 PanSouSubscribe）
     # ================================================================
@@ -4543,12 +5398,18 @@ function startPolling() {
         """定时任务：检查所有网盘订阅（带互斥，避免多路触发并发覆盖）。"""
         lock = self._get_subscription_check_lock()
         if not lock.acquire(blocking=False):
-            logger.info("【115助手】已有订阅巡检正在运行，本次触发跳过")
+            self._subscription_check_pending_reason = "并发触发补跑"
+            logger.info("【115助手】已有订阅巡检正在运行，本次触发已排队补跑")
             return
         try:
             return self._check_subscriptions_impl()
         finally:
             lock.release()
+            pending_reason = getattr(self, "_subscription_check_pending_reason", "")
+            if pending_reason:
+                self._subscription_check_pending_reason = ""
+                logger.info(f"【115助手】订阅巡检补跑启动: {pending_reason}")
+                _threading_mod.Thread(target=self.check_subscriptions, daemon=True).start()
 
     def _get_subscription_check_lock(self):
         """获取订阅巡检互斥锁。"""
@@ -4561,7 +5422,8 @@ function startPolling() {
     def _start_subscription_check_background(self, reason: str = "手动触发") -> bool:
         """后台启动一次订阅巡检。"""
         if self._get_subscription_check_lock().locked():
-            logger.info(f"【115助手】订阅巡检已有任务在运行，跳过触发: {reason}")
+            self._subscription_check_pending_reason = reason
+            logger.info(f"【115助手】订阅巡检已有任务在运行，已排队补跑: {reason}")
             return False
         logger.info(f"【115助手】订阅巡检后台启动: {reason}")
         _threading_mod.Thread(target=self.check_subscriptions, daemon=True).start()
@@ -4607,6 +5469,244 @@ function startPolling() {
 
     def _save_runtime_state(self) -> None:
         self.save_data("runtime_state", self._runtime_state or {})
+
+    # ── 失效分享链接黑名单 ─────────────────────────────
+    _DEAD_SHARE_TTL_SECONDS = 7 * 24 * 3600
+    _DEAD_SHARE_MAX = 500
+
+    def _load_dead_shares(self) -> dict:
+        state = self._load_runtime_state()
+        data = state.get("dead_shares")
+        return data if isinstance(data, dict) else {}
+
+    def _is_dead_share_link(self, share_url: str) -> bool:
+        """分享已被取消/失效的链接在 TTL 内直接跳过，不再重复请求。"""
+        if not share_url:
+            return False
+        expire = self._load_dead_shares().get(str(share_url))
+        try:
+            return float(expire or 0) > time.time()
+        except (TypeError, ValueError):
+            return False
+
+    def _mark_dead_share_link(self, share_url: str, cloud_name: str = "") -> None:
+        if not share_url:
+            return
+        state = self._load_runtime_state()
+        dead = state.get("dead_shares")
+        if not isinstance(dead, dict):
+            dead = {}
+        now = time.time()
+        # 顺手清掉过期项，并在超量时保留最近的一批
+        dead = {k: v for k, v in dead.items() if float(v or 0) > now}
+        dead[str(share_url)] = now + self._DEAD_SHARE_TTL_SECONDS
+        if len(dead) > self._DEAD_SHARE_MAX:
+            dead = dict(sorted(dead.items(), key=lambda kv: kv[1], reverse=True)[: self._DEAD_SHARE_MAX])
+        state["dead_shares"] = dead
+        self._runtime_state = state
+        self._save_runtime_state()
+        logger.info(
+            f"【115助手】[降级] {cloud_name}分享已失效，加入黑名单 "
+            f"{self._DEAD_SHARE_TTL_SECONDS // 86400} 天: {str(share_url)[:70]}"
+        )
+
+    def _plugin_notice_subject_key(self, subscription: dict) -> str:
+        media_type_str = str(subscription.get("media_type") or "电视剧")
+        season = int(subscription.get("season") or 1)
+        tmdb_id = subscription.get("tmdb_id")
+        try:
+            tmdb_id = int(tmdb_id) if tmdb_id not in (None, "") else None
+        except (TypeError, ValueError):
+            tmdb_id = None
+        if tmdb_id:
+            subject = f"tmdb:{tmdb_id}"
+        else:
+            title = str(subscription.get("title") or "").strip()
+            year = str(subscription.get("year") or "").strip()
+            subject = f"title:{title}|year:{year}"
+        return f"{media_type_str}|{subject}|S{season:02d}"
+
+    def _plugin_notice_rate_subject_key(self, subscription: dict) -> str:
+        """通知限频按作品聚合，季号不同仍视为同一部剧。"""
+        media_type_str = str(subscription.get("media_type") or "电视剧")
+        tmdb_id = subscription.get("tmdb_id")
+        try:
+            tmdb_id = int(tmdb_id) if tmdb_id not in (None, "") else None
+        except (TypeError, ValueError):
+            tmdb_id = None
+        if tmdb_id:
+            subject = f"tmdb:{tmdb_id}"
+        else:
+            title = str(subscription.get("title") or "").strip().casefold()
+            year = str(subscription.get("year") or "").strip()
+            subject = f"title:{title}|year:{year}"
+        return f"{media_type_str}|{subject}"
+
+    def _load_plugin_notice_rate_events(
+        self,
+        now: Optional[datetime] = None,
+    ) -> List[dict]:
+        state = self._load_runtime_state()
+        raw = state.get(self._PLUGIN_NOTICE_RATE_KEY)
+        if not isinstance(raw, list):
+            return []
+
+        now = now or datetime.now()
+        retention_seconds = max(
+            int(self._notice_same_title_window_minutes),
+            int(self._notice_global_window_minutes),
+        ) * 60
+        cleaned = []
+        changed = False
+        for item in raw:
+            if not isinstance(item, dict):
+                changed = True
+                continue
+            sent_at_raw = item.get("sent_at")
+            try:
+                sent_at = datetime.fromisoformat(str(sent_at_raw))
+            except (TypeError, ValueError):
+                changed = True
+                continue
+            age_seconds = (now - sent_at).total_seconds()
+            if age_seconds > retention_seconds:
+                changed = True
+                continue
+            cleaned.append({
+                "subject": str(item.get("subject") or ""),
+                "sent_at": sent_at.isoformat(),
+            })
+        if changed:
+            if cleaned:
+                state[self._PLUGIN_NOTICE_RATE_KEY] = cleaned
+            else:
+                state.pop(self._PLUGIN_NOTICE_RATE_KEY, None)
+            self._save_runtime_state()
+        return cleaned
+
+    def _check_plugin_notice_rate_limit(
+        self,
+        subscription: dict,
+        now: Optional[datetime] = None,
+    ) -> Tuple[bool, str, int]:
+        """返回 (是否允许, 命中的限制, 建议重试秒数)。"""
+        now = now or datetime.now()
+        now_ts = now.timestamp()
+        subject = self._plugin_notice_rate_subject_key(subscription)
+        events = self._load_plugin_notice_rate_events(now=now)
+
+        same_window_seconds = int(self._notice_same_title_window_minutes) * 60
+        same_events = sorted(
+            datetime.fromisoformat(item["sent_at"]).timestamp()
+            for item in events
+            if item.get("subject") == subject
+            and now_ts - datetime.fromisoformat(item["sent_at"]).timestamp() < same_window_seconds
+        )
+        if len(same_events) >= int(self._notice_same_title_max):
+            retry_after = max(1, int(same_events[0] + same_window_seconds - now_ts + 0.999))
+            return False, "same_title", retry_after
+
+        global_window_seconds = int(self._notice_global_window_minutes) * 60
+        global_events = sorted(
+            datetime.fromisoformat(item["sent_at"]).timestamp()
+            for item in events
+            if now_ts - datetime.fromisoformat(item["sent_at"]).timestamp() < global_window_seconds
+        )
+        if len(global_events) >= int(self._notice_global_max):
+            retry_after = max(1, int(global_events[0] + global_window_seconds - now_ts + 0.999))
+            return False, "global", retry_after
+        return True, "", 0
+
+    def _record_plugin_notice_rate_event(
+        self,
+        subscription: dict,
+        now: Optional[datetime] = None,
+    ) -> None:
+        now = now or datetime.now()
+        state = self._load_runtime_state()
+        events = self._load_plugin_notice_rate_events(now=now)
+        events.append({
+            "subject": self._plugin_notice_rate_subject_key(subscription),
+            "sent_at": now.isoformat(),
+        })
+        state[self._PLUGIN_NOTICE_RATE_KEY] = events
+        self._save_runtime_state()
+
+    def _group_cd2_watch_notice_records(self, records: List[dict]) -> List[List[dict]]:
+        """将同一作品的多季记录合并为一个发送批次。"""
+        grouped: Dict[str, List[dict]] = {}
+        for record in records or []:
+            subscription = self._build_cd2_watch_subscription(record)
+            key = self._plugin_notice_rate_subject_key(subscription)
+            grouped.setdefault(key, []).append(record)
+        return list(grouped.values())
+
+    def _format_multi_season_notice(self, records: List[dict]) -> str:
+        season_episodes: Dict[int, set] = {}
+        for record in records or []:
+            try:
+                season = int(record.get("season") or 1)
+            except (TypeError, ValueError):
+                season = 1
+            season_episodes.setdefault(season, set()).update(
+                int(ep) for ep in (record.get("episodes") or []) if ep is not None
+            )
+        seasons = sorted(season_episodes)
+        if not seasons:
+            return ""
+
+        ranges = []
+        start = previous = seasons[0]
+        for season in seasons[1:] + [None]:
+            if season is not None and season == previous + 1:
+                previous = season
+                continue
+            if start == previous:
+                ranges.append(f"S{start:02d}")
+            else:
+                ranges.append(f"S{start:02d}-S{previous:02d}")
+            if season is not None:
+                start = previous = season
+        episode_count = sum(len(episodes) for episodes in season_episodes.values())
+        return f"{','.join(ranges)} 共{episode_count}集"
+
+    def _plugin_notice_episode_key(self, subscription: dict, episode: int) -> str:
+        return f"{self._plugin_notice_subject_key(subscription)}|E{int(episode):02d}"
+
+    def _load_plugin_notice_sent_map(self) -> dict:
+        state = self._load_runtime_state()
+        raw = state.get(self._PLUGIN_NOTICE_SENT_KEY)
+        if not isinstance(raw, dict):
+            return {}
+
+        now = datetime.now()
+        cleaned = {}
+        changed = False
+        for key, value in raw.items():
+            sent_at = self._parse_iso_datetime(value)
+            if sent_at and (now - sent_at).total_seconds() > self._PLUGIN_NOTICE_SENT_TTL_SECONDS:
+                changed = True
+                continue
+            cleaned[str(key)] = str(value or "")
+        if changed:
+            if cleaned:
+                state[self._PLUGIN_NOTICE_SENT_KEY] = cleaned
+            else:
+                state.pop(self._PLUGIN_NOTICE_SENT_KEY, None)
+            self._save_runtime_state()
+        return cleaned
+
+    def _mark_plugin_notice_sent(self, subscription: dict, episodes: List[int]) -> None:
+        cleaned = sorted({int(ep) for ep in episodes if ep is not None})
+        if not cleaned or subscription.get("media_type") == "电影":
+            return
+        state = self._load_runtime_state()
+        sent = self._load_plugin_notice_sent_map()
+        now_iso = datetime.now().isoformat()
+        for ep in cleaned:
+            sent[self._plugin_notice_episode_key(subscription, ep)] = now_iso
+        state[self._PLUGIN_NOTICE_SENT_KEY] = sent
+        self._save_runtime_state()
 
     @staticmethod
     def _normalize_episode_map(value: Any) -> Dict[int, List[int]]:
@@ -4922,6 +6022,7 @@ function startPolling() {
                     tmdb_id=tmdb_id,
                     media_type_str=media_type_str,
                     season=season,
+                    total_episodes=show_state.get("total_episodes"),
                 )
                 if existing:
                     confirmed[season] = sorted(set(confirmed.get(season, [])) | {int(ep) for ep in existing})
@@ -5006,10 +6107,11 @@ function startPolling() {
             )
             if created_at and (now - created_at).total_seconds() > self._CD2_WATCH_NOTICE_TTL_SECONDS:
                 continue
-            key = str(item.get("key") or "")
+            key = self._cd2_watch_notice_stable_key(item) or str(item.get("key") or "")
             if key and key in seen:
                 continue
             if key:
+                item["key"] = key
                 seen.add(key)
             pruned.append(item)
         return pruned
@@ -5029,9 +6131,18 @@ function startPolling() {
     def _append_cd2_watch_pending_notices(self, notices: List[dict]) -> None:
         if not notices:
             return
-        merged = self._load_cd2_watch_pending_notices()
-        merged.extend(notices)
-        self._save_cd2_watch_pending_notices(merged)
+        merged_by_key = {}
+        passthrough = []
+        for item in self._load_cd2_watch_pending_notices() + notices:
+            if not isinstance(item, dict):
+                continue
+            key = self._cd2_watch_notice_stable_key(item) or str(item.get("key") or "")
+            if key:
+                item["key"] = key
+                merged_by_key[key] = item
+            else:
+                passthrough.append(item)
+        self._save_cd2_watch_pending_notices([*merged_by_key.values(), *passthrough])
 
     def _is_115_cooldown_active(self, reason: str = "") -> bool:
         state = self._load_runtime_state()
@@ -5243,26 +6354,53 @@ function startPolling() {
             if sub.get("auto_completed"):
                 completed.append(sub.get("title", ""))
 
-        # 完结的订阅移入历史记录
-        if completed:
-            history = self._load_history()
-            completed_subs = [s for s in subscriptions if s.get("auto_completed")]
-            for s in completed_subs:
-                s["status"] = "completed"
-                history.append(s)
-            self._save_history(history)
-
-            subscriptions[:] = [s for s in subscriptions if not s.get("auto_completed")]
-            logger.info(f"【115助手】自动完结订阅已移入历史: {', '.join(completed)}")
-            if self._notify:
-                self.post_message(
-                    mtype=NotificationType.MediaServer,
-                    title="115网盘助手 - 自动完结",
-                    text=f"以下订阅已完结并归档:\n{', '.join(completed)}",
-                )
-
         with self._subscriptions_lock:
+            completed_subs = [s for s in subscriptions if s.get("auto_completed")]
+            completed_map = {
+                self._subscription_key(s): s
+                for s in completed_subs
+                if self._subscription_key(s)[0] is not None
+            }
+            completed_keys = set(completed_map.keys())
+            latest_subscriptions = self._load_subscriptions()
+            latest_by_key = {
+                self._subscription_key(s): s
+                for s in latest_subscriptions
+                if self._subscription_key(s)[0] is not None
+            }
+            completed_names = []
+            if completed_map:
+                history = self._load_history()
+                for key, sub in completed_map.items():
+                    latest_sub = latest_by_key.get(key)
+                    if not latest_sub or not self._subscription_identity_matches(latest_sub, sub):
+                        logger.info(
+                            f"【115助手】订阅巡检检测到 {sub.get('title', key[0])} 已被移除或重新添加，"
+                            "跳过自动完结写入"
+                        )
+                        continue
+                    item = dict(sub)
+                    item["status"] = "completed"
+                    history.append(item)
+                    completed_names.append(item.get("title", ""))
+                if completed_names:
+                    self._save_history(history)
+                    logger.info(f"【115助手】自动完结订阅已移入历史: {', '.join(completed_names)}")
+
+            subscriptions = self._merge_processed_subscriptions(
+                latest_subscriptions=latest_subscriptions,
+                processed_subscriptions=subscriptions,
+                completed_keys=completed_keys,
+                context="订阅巡检",
+            )
             self._save_subscriptions(subscriptions)
+
+        if completed_names and self._notify:
+            self.post_message(
+                mtype=NotificationType.MediaServer,
+                title="115网盘助手 - 自动完结",
+                text=f"以下订阅已完结并归档:\n{', '.join(completed_names)}",
+            )
 
         has_pending = any(self._get_pending_episode_numbers(sub) for sub in subscriptions)
         if has_pending:
@@ -5330,12 +6468,38 @@ function startPolling() {
                 previous_cached_episodes.add(int(ep))
             except (TypeError, ValueError):
                 continue
+        tmdb_meta_out: dict = {}
+        total_eps = self._get_total_episodes(
+            title, tmdb_id, media_type_str, season, meta_out=tmdb_meta_out
+        )
+        if tmdb_meta_out.get("fetched"):
+            # 成功取到 TMDB 数据时刷新播出状态缓存（含「无下一集」这一状态），
+            # 失败时沿用上次缓存，与总集数缓存的兜底策略一致。
+            sub["_cache_tmdb_status"] = tmdb_meta_out.get("status") or ""
+            sub["_cache_has_next_episode"] = bool(tmdb_meta_out.get("next_episode_to_air"))
+            aired_now = tmdb_meta_out.get("aired_episodes")
+            if aired_now:
+                # 已播出集数只增不减，避免 TMDB 偶发返回空把进度冲掉
+                try:
+                    prev_aired = int(sub.get("_cache_aired_episodes") or 0)
+                except (TypeError, ValueError):
+                    prev_aired = 0
+                sub["_cache_aired_episodes"] = max(prev_aired, int(aired_now))
+            sub["_cache_next_air_date"] = tmdb_meta_out.get("next_air_date") or ""
+        if not total_eps:
+            previous_total = sub.get("_cache_total_episodes")
+            if isinstance(previous_total, int) and previous_total > 0:
+                logger.info(
+                    f"【115助手】{title} 本次未取到总集数，沿用上次缓存: {previous_total}"
+                )
+                total_eps = previous_total
         real_existing_episodes = self._get_existing_episodes(
             title,
             tmdb_id,
             media_type_str,
             season,
             cached_episodes=sorted(previous_cached_episodes),
+            total_episodes=total_eps,
         )
         real_existing_set = set(real_existing_episodes)
         logger.info(f"【115助手】{title} 已入库集数: {real_existing_episodes}")
@@ -5345,14 +6509,14 @@ function startPolling() {
                 notice_episodes, skipped_episodes = self._filter_plugin_notice_episodes(sub, newly_existing)
                 if skipped_episodes:
                     logger.info(
-                        f"【115助手】{title} MP 本体已有整理历史，跳过插件补通知: "
+                        f"【115助手】{title} 已有整理历史或插件通知账本，跳过插件补通知: "
                         f"{self._format_episode_preview(skipped_episodes)}"
                     )
                 if notice_episodes:
                     self._post_organize_success_template_message(
                         subscription=sub,
                         episodes=notice_episodes,
-                        reason="巡检确认 115 入库",
+                        reason="115 入库确认",
                     )
                     ep_text = self._format_episode_preview(notice_episodes)
                     logger.info(f"【115助手】{title} 发送新增入库补偿通知: {ep_text}")
@@ -5379,12 +6543,14 @@ function startPolling() {
                     pending_episodes = sorted(pending_set)
                     if pending_episodes:
                         sub["pending_copy_episodes"] = pending_episodes
+                        self._prune_pending_source_records(sub, pending_episodes)
                         logger.info(
                             f"【115助手】{title} 待入库集数 (age={int(_pending_age)}s): {pending_episodes}"
                         )
                     else:
                         logger.info(f"【115助手】{title} 待入库集数已全部入库，清除 pending 标记")
                         sub.pop("pending_copy_episodes", None)
+                        sub.pop("pending_copy_files", None)
                         sub.pop("pending_copy_since", None)
                         sub.pop("pending_copy_status", None)
                 else:
@@ -5399,6 +6565,7 @@ function startPolling() {
                     pending_episodes = sorted(pending_set)
                     if pending_episodes:
                         sub["pending_copy_episodes"] = pending_episodes
+                        self._prune_pending_source_records(sub, pending_episodes)
                         sub["pending_copy_status"] = "organize_retry"
                         sub["_cache_pending_retry"] = True
                         logger.info(
@@ -5407,6 +6574,7 @@ function startPolling() {
                     else:
                         logger.info(f"【115助手】{title} 待入库集数已全部入库，清除 pending 标记")
                         sub.pop("pending_copy_episodes", None)
+                        sub.pop("pending_copy_files", None)
                         sub.pop("pending_copy_since", None)
                         sub.pop("pending_copy_status", None)
             except Exception as e:
@@ -5432,14 +6600,6 @@ function startPolling() {
         sub["_cache_pending_count"] = len(pending_episodes)
         sub["_cache_pending_episodes"] = pending_episodes
         sub["_cache_pending_since"] = _pending_since if pending_episodes else ""
-        total_eps = self._get_total_episodes(title, tmdb_id, media_type_str, season)
-        if not total_eps:
-            previous_total = sub.get("_cache_total_episodes")
-            if isinstance(previous_total, int) and previous_total > 0:
-                logger.info(
-                    f"【115助手】{title} 本次未取到总集数，沿用上次缓存: {previous_total}"
-                )
-                total_eps = previous_total
         sub["_cache_total_episodes"] = total_eps
         sub["_cache_updated"] = datetime.now().isoformat()
         target_missing_episodes = []
@@ -5466,7 +6626,14 @@ function startPolling() {
                 sub["completed_time"] = datetime.now().isoformat()
                 sub["completed_reason"] = "已入库"
                 return
-        elif total_eps and len(real_existing_set) >= total_eps:
+        elif total_eps and set(range(1, int(total_eps) + 1)).issubset(real_existing_set):
+            if not self._should_allow_auto_complete(sub):
+                logger.info(
+                    f"【115助手】{title} 已覆盖 TMDB 当前已知集数 "
+                    f"({len(real_existing_set)}/{total_eps})，但剧集仍在播出，"
+                    "保持订阅等待后续更新，本轮不再搜索"
+                )
+                return
             logger.info(
                 f"【115助手】{title} 已全集入库 ({len(real_existing_set)}/{total_eps} 集)，"
                 "跳过搜索并标记自动取消"
@@ -5476,6 +6643,15 @@ function startPolling() {
             sub["completed_reason"] = f"全集入库 ({len(real_existing_set)}/{total_eps})"
             return
 
+        # 追平已播出进度就不再空搜：TMDB 总集数含未播出的集，按它算缺失会让插件
+        # 每轮都去搜根本还没播的集（实测每部剧每天约 100 轮、近乎全部白搜）。
+        _skip_airing, _skip_reason = self._should_skip_airing_search(
+            sub, effective_existing_episodes, total_eps
+        )
+        if _skip_airing:
+            logger.info(f"【115助手】{title} 已刷新入库进度；{_skip_reason}，本轮不搜索/降级")
+            return
+
         if self._is_115_cooldown_active(f"{title} 的 115 搜索/转存"):
             logger.info(f"【115助手】{title} 已刷新入库进度；115 风控冷却期内不搜索/转存")
             return
@@ -5483,6 +6659,9 @@ function startPolling() {
         if not config_115.get("cookies"):
             logger.info(f"【115助手】{title} 已刷新入库进度；无可用 115 Cookie，跳过搜索和转存")
             return
+
+        # 真正进入搜索/降级，记录时间供兜底探针计时
+        sub["_last_search_at"] = datetime.now().isoformat()
 
         # 2. 搜索 PanSou — 只用纯标题（去掉年份），年份用于结果排序
         clean_keyword = self._strip_year(search_keyword)
@@ -5678,6 +6857,7 @@ function startPolling() {
                 missing_files = self._find_missing_episodes(
                     parsed_files, season, effective_existing_episodes,
                     media_type_str=media_type_str,
+                    total_episodes=total_eps,
                 )
                 if not missing_files:
                     logger.info(f"【115助手】{title} 分享 {share_code} 没有缺失集数")
@@ -5733,6 +6913,7 @@ function startPolling() {
                 if found_episode_nums:
                     found_episode_nums_this_run.update(found_episode_nums)
                     sub["last_found_episodes"] = sorted(found_episode_nums_this_run)
+                    self._merge_pending_source_records(sub, missing_files, season)
 
                 if media_type_str != "电影" and found_episode_nums:
                     effective_existing_episodes = sorted(
@@ -5753,6 +6934,7 @@ function startPolling() {
                         sub["_cache_pending_count"] = len(pending_episodes)
                         sub["_cache_pending_episodes"] = pending_episodes
                         sub["_cache_pending_since"] = pending_since_now
+                        self._prune_pending_source_records(sub, pending_episodes)
 
                 if self._notify:
                     self.post_message(
@@ -5776,7 +6958,10 @@ function startPolling() {
                     )
                     break
 
-                if total_eps and len(set(effective_existing_episodes)) >= total_eps:
+                if (
+                    total_eps
+                    and set(range(1, int(total_eps) + 1)).issubset(set(effective_existing_episodes))
+                ):
                     logger.info(
                         f"【115助手】{title} 本轮已覆盖全集 ({len(set(effective_existing_episodes))}/{total_eps})，停止继续遍历"
                     )
@@ -5795,7 +6980,7 @@ function startPolling() {
         # 短路条件：总集数已知且 Plex 已有全部集数时，跳过降级（无需补全）
         _fallback_has_missing = (
             not total_eps  # 总集数未知，保守策略继续检查
-            or len(set(effective_existing_episodes)) < total_eps  # 确实有缺失
+            or not set(range(1, int(total_eps) + 1)).issubset(set(effective_existing_episodes))  # 确实有缺失
         )
         if (media_type_str != "电影"
                 and self._fallback_enabled
@@ -5817,14 +7002,23 @@ function startPolling() {
         elif real_existing_episodes:
             # 优先用 TMDB 总集数，不可用时再从搜索描述中检测
             check_total = total_eps or self._detect_total_episodes(search_results, title)
-            if check_total and len(real_existing_episodes) >= check_total:
-                logger.info(
-                    f"【115助手】{title} 已全集入库 ({len(real_existing_episodes)}/{check_total} 集)，"
-                    f"标记自动取消"
-                )
-                sub["auto_completed"] = True
-                sub["completed_time"] = datetime.now().isoformat()
-                sub["completed_reason"] = f"全集入库 ({len(real_existing_episodes)}/{check_total})"
+            if (
+                check_total
+                and set(range(1, int(check_total) + 1)).issubset(set(real_existing_episodes))
+            ):
+                if not self._should_allow_auto_complete(sub):
+                    logger.info(
+                        f"【115助手】{title} 已覆盖当前已知 {check_total} 集，"
+                        "但剧集仍在播出，暂不自动完结"
+                    )
+                else:
+                    logger.info(
+                        f"【115助手】{title} 已全集入库 ({len(real_existing_episodes)}/{check_total} 集)，"
+                        f"标记自动取消"
+                    )
+                    sub["auto_completed"] = True
+                    sub["completed_time"] = datetime.now().isoformat()
+                    sub["completed_reason"] = f"全集入库 ({len(real_existing_episodes)}/{check_total})"
 
     def _organize_pending_subscriptions(
         self,
@@ -5842,6 +7036,23 @@ function startPolling() {
                 logger.info("【115助手】没有活跃订阅，跳过待入库整理")
                 return
 
+            target_subs = []
+            for sub in subscriptions:
+                if tmdb_id and int(sub.get("tmdb_id") or 0) != int(tmdb_id):
+                    continue
+                if season and int(sub.get("season") or 0) != int(season):
+                    continue
+                if not self._get_pending_episode_numbers(sub):
+                    if tmdb_id:
+                        sub["_force_scan_pending_staging"] = True
+                    else:
+                        continue
+                target_subs.append(sub)
+
+            if not target_subs:
+                logger.info("【115助手】没有待入库订阅，跳过待入库整理")
+                return
+
             if self._is_115_cooldown_active("待入库整理"):
                 return
 
@@ -5852,13 +7063,22 @@ function startPolling() {
 
             total_files = 0
             total_subs = 0
-            for sub in subscriptions:
+            for sub in target_subs:
                 try:
-                    if tmdb_id and int(sub.get("tmdb_id") or 0) != int(tmdb_id):
-                        continue
-                    if season and int(sub.get("season") or 0) != int(season):
-                        continue
                     pending_eps = self._get_pending_episode_numbers(sub)
+                    if not pending_eps and sub.pop("_force_scan_pending_staging", False):
+                        pending_eps = self._discover_pending_staging_episodes(sub, active_cookie)
+                        if pending_eps:
+                            now_iso = datetime.now().isoformat()
+                            sub["pending_copy_episodes"] = pending_eps
+                            sub["pending_copy_since"] = now_iso
+                            sub["pending_copy_status"] = "organize_retry"
+                            sub["_cache_pending_count"] = len(pending_eps)
+                            sub["_cache_pending_episodes"] = pending_eps
+                            sub["_cache_pending_since"] = now_iso
+                            logger.info(
+                                f"【115助手】{sub.get('title')} 手动整理从待整理目录发现 pending: {pending_eps}"
+                            )
                     if not pending_eps:
                         continue
                     total_subs += 1
@@ -5874,6 +7094,11 @@ function startPolling() {
                     )
 
             with self._subscriptions_lock:
+                subscriptions = self._merge_processed_subscriptions(
+                    latest_subscriptions=self._load_subscriptions(),
+                    processed_subscriptions=subscriptions,
+                    context="待入库整理",
+                )
                 self._save_subscriptions(subscriptions)
 
             logger.info(
@@ -5893,6 +7118,213 @@ function startPolling() {
             except (TypeError, ValueError):
                 continue
         return sorted(pending)
+
+    def _discover_pending_staging_episodes(self, subscription: dict, cookies: str) -> List[int]:
+        """手动整理兜底：从待整理目录按订阅标题发现待入库集数。"""
+        cid = self._get_staging_cid_for_subscription(subscription)
+        base_path = self._get_mp_staging_path(subscription)
+        if not cid or cid == "0" or not base_path:
+            return []
+        raw_files = self._list_own_files_115_tree(cookies, cid, base_path)
+        if not raw_files:
+            return []
+        parsed_files = self._parse_files(raw_files)
+        target_season = int(subscription.get("season") or 1)
+        try:
+            total_episodes = int(subscription.get("_cache_total_episodes") or 0)
+        except (TypeError, ValueError):
+            total_episodes = 0
+        episodes = set()
+        for parsed in parsed_files:
+            file_season = int(parsed.get("season") or 1)
+            if file_season != target_season:
+                continue
+            name = str(parsed.get("name") or "")
+            source = next((item for item in raw_files if item.get("file_id") == parsed.get("file_id")), {})
+            path = str(source.get("path") or "")
+            title_state = self._subscription_title_match_state(f"{path} {name}", subscription)
+            if title_state is not True:
+                continue
+            for ep in parsed.get("episode_list") or []:
+                try:
+                    episodes.add(int(ep))
+                except (TypeError, ValueError):
+                    continue
+            if parsed.get("episode"):
+                try:
+                    episodes.add(int(parsed["episode"]))
+                except (TypeError, ValueError):
+                    pass
+        return sorted(
+            ep for ep in episodes
+            if ep > 0 and (not total_episodes or ep <= total_episodes)
+        )
+
+    @staticmethod
+    def _normalize_pending_source_name(value: str) -> str:
+        """Normalize a staging/source filename for matching 115 receive conflict copies."""
+        name = Path(str(value or "")).name
+        name = re.sub(r"\(\d+\)(?=\.[^.]+$)", "", name)
+        return name.strip().lower()
+
+    @staticmethod
+    def _episode_set_from_record(record: dict) -> set:
+        episodes = set()
+        for ep in record.get("episodes") or record.get("episode_list") or []:
+            try:
+                episodes.add(int(ep))
+            except (TypeError, ValueError):
+                continue
+        if record.get("episode"):
+            try:
+                episodes.add(int(record.get("episode")))
+            except (TypeError, ValueError):
+                pass
+        return episodes
+
+    def _merge_pending_source_records(self, subscription: dict, files: List[dict], season: Optional[int]) -> None:
+        """Remember exact source filenames saved into 115 staging for later closed-loop matching."""
+        records = subscription.get("pending_copy_files")
+        if not isinstance(records, list):
+            records = []
+
+        merged = {}
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            name = str(record.get("name") or "").strip()
+            key = self._normalize_pending_source_name(name)
+            if not key:
+                continue
+            episodes = sorted(self._episode_set_from_record(record))
+            if not episodes:
+                continue
+            merged[key] = {
+                "name": name,
+                "episodes": episodes,
+                "season": record.get("season") or season or 1,
+                "size": int(record.get("size", 0) or 0),
+                "source_file_id": str(record.get("source_file_id") or record.get("file_id") or ""),
+                "updated_at": record.get("updated_at") or datetime.now().isoformat(),
+            }
+
+        now_text = datetime.now().isoformat()
+        for item in files or []:
+            name = str(item.get("name") or "").strip()
+            key = self._normalize_pending_source_name(name)
+            episodes = sorted(self._episode_set_from_record(item))
+            if not key or not episodes:
+                continue
+            merged[key] = {
+                "name": name,
+                "episodes": episodes,
+                "season": item.get("season") or season or 1,
+                "size": int(item.get("size", 0) or 0),
+                "source_file_id": str(item.get("file_id") or ""),
+                "updated_at": now_text,
+            }
+
+        if merged:
+            subscription["pending_copy_files"] = list(merged.values())[-100:]
+
+    def _prune_pending_source_records(self, subscription: dict, pending_episodes: List[int]) -> None:
+        """Keep source filename records only for episodes still waiting to be organized."""
+        pending_set = {int(ep) for ep in pending_episodes or [] if ep is not None}
+        if not pending_set:
+            subscription.pop("pending_copy_files", None)
+            return
+        records = subscription.get("pending_copy_files")
+        if not isinstance(records, list):
+            return
+        kept = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            if self._episode_set_from_record(record) & pending_set:
+                kept.append(record)
+        if kept:
+            subscription["pending_copy_files"] = kept[-100:]
+        else:
+            subscription.pop("pending_copy_files", None)
+
+    def _pending_source_file_matches(
+        self,
+        subscription: dict,
+        name: str,
+        path: str,
+        episodes: set,
+        pending_set: set,
+    ) -> bool:
+        """Match staging files by the exact source filenames saved during 115 direct receive."""
+        records = subscription.get("pending_copy_files")
+        if not isinstance(records, list) or not records:
+            return False
+
+        candidate_names = {
+            self._normalize_pending_source_name(name),
+            self._normalize_pending_source_name(path),
+        }
+        candidate_names.discard("")
+        if not candidate_names:
+            return False
+
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            record_eps = self._episode_set_from_record(record)
+            if record_eps and not (record_eps & episodes & pending_set):
+                continue
+            record_name = self._normalize_pending_source_name(str(record.get("name") or ""))
+            if record_name and record_name in candidate_names:
+                return True
+        return False
+
+    def _staging_file_matches_expected_tmdb(
+        self,
+        subscription: dict,
+        name: str,
+        media_cache: dict,
+    ) -> bool:
+        """Fallback for older pending tasks that were saved before source filename records existed."""
+        try:
+            expected_tmdb = int(subscription.get("tmdb_id") or 0)
+        except (TypeError, ValueError):
+            expected_tmdb = 0
+        if not expected_tmdb:
+            return False
+
+        cache_key = self._normalize_pending_source_name(name)
+        if not cache_key:
+            return False
+        if cache_key in media_cache:
+            return bool(media_cache[cache_key])
+
+        try:
+            media_chain = media_cache.get("__media_chain")
+            if media_chain is None:
+                media_chain = MediaChain()
+                media_cache["__media_chain"] = media_chain
+            meta = ParseMeta(Path(name).stem)
+            meta.type = MediaType.MOVIE if subscription.get("media_type") == "电影" else MediaType.TV
+            if subscription.get("season"):
+                meta.begin_season = int(subscription.get("season") or 1)
+            mediainfo = media_chain.recognize_by_meta(meta)
+            actual_tmdb = getattr(mediainfo, "tmdb_id", None) if mediainfo else None
+            try:
+                actual_tmdb = int(actual_tmdb) if actual_tmdb not in (None, "") else None
+            except (TypeError, ValueError):
+                actual_tmdb = None
+            matched = actual_tmdb == expected_tmdb
+            media_cache[cache_key] = matched
+            if matched:
+                logger.info(
+                    f"【115助手】{subscription.get('title')} 待入库文件通过 TMDB 匹配: {name}"
+                )
+            return matched
+        except Exception as e:
+            logger.debug(f"【115助手】待入库文件 TMDB 匹配失败: {name} | {e}")
+            media_cache[cache_key] = False
+            return False
 
     def _get_staging_cid_for_subscription(self, subscription: dict) -> str:
         """根据订阅分类返回对应 115 临时目录 CID。"""
@@ -5982,19 +7414,32 @@ function startPolling() {
 
         by_id = {item.get("file_id"): item for item in raw_files}
         parsed_files = self._parse_files(raw_files)
-        pending_set = set(pending_episodes)
+        try:
+            total_episodes = int(subscription.get("_cache_total_episodes") or 0)
+        except (TypeError, ValueError):
+            total_episodes = 0
+        pending_set = set()
+        for ep in pending_episodes or []:
+            try:
+                ep_num = int(ep)
+            except (TypeError, ValueError):
+                continue
+            if ep_num > 0 and (not total_episodes or ep_num <= total_episodes):
+                pending_set.add(ep_num)
+        if not pending_set:
+            logger.info(
+                f"【115助手】{subscription.get('title')} pending 集数均超过总集数上限，跳过待入库匹配"
+            )
+            return []
         title = subscription.get("title", "")
         target_season = subscription.get("season") or 1
         matched = []
+        media_match_cache = {}
 
         for parsed in parsed_files:
             source = by_id.get(parsed.get("file_id"), {})
             name = parsed.get("name", "")
             path = source.get("path", "")
-
-            # 优先靠标题收窄范围，避免把同目录里的其它剧误整理。
-            if title and title not in name and title not in path:
-                continue
 
             file_season = parsed.get("season") or 1
             if target_season and file_season != int(target_season):
@@ -6013,6 +7458,49 @@ function startPolling() {
                     pass
 
             if not episodes or not (episodes & pending_set):
+                continue
+            if total_episodes and any(ep > total_episodes for ep in episodes):
+                logger.info(
+                    f"【115助手】{title} 待入库跳过超过总集数的文件: "
+                    f"episodes={sorted(episodes)}, total={total_episodes}, name={name}"
+                )
+                continue
+
+            # 优先靠标题收窄范围；文件名本身一旦明确是串剧，不能被
+            # 待整理路径里的目标剧名放行。115 直转保留英文源名时，
+            # 再改用转存时记录的源文件名或 TMDB 兜底识别。
+            name_title_state = self._subscription_title_match_state(name, subscription)
+            if name_title_state is False:
+                logger.info(
+                    f"【115助手】{title} 待入库跳过疑似串剧文件: {name}"
+                )
+                continue
+            path_title_state = self._subscription_title_match_state(path, subscription)
+            if name_title_state is None and path_title_state is False:
+                logger.info(
+                    f"【115助手】{title} 待入库跳过疑似串剧路径: {path}"
+                )
+                continue
+
+            title_hit = (
+                name_title_state is True
+                or (name_title_state is None and path_title_state is True)
+            )
+            source_hit = self._pending_source_file_matches(
+                subscription,
+                name,
+                path,
+                episodes,
+                pending_set,
+            )
+            tmdb_hit = False
+            if title and not title_hit and not source_hit:
+                tmdb_hit = self._staging_file_matches_expected_tmdb(
+                    subscription,
+                    name,
+                    media_match_cache,
+                )
+            if title and not (title_hit or source_hit or tmdb_hit):
                 continue
 
             matched.append({
@@ -6057,6 +7545,625 @@ function startPolling() {
         )
         return matched
 
+    def _get_closed_loop_library_path(self, subscription: dict) -> str:
+        """根据订阅分类返回插件闭环整理的正式媒体库路径。"""
+        media_type = subscription.get("media_type", "")
+        media_category = subscription.get("media_category", "ongoing")
+        if media_type == "电影":
+            if media_category == "movie_archive":
+                return self._to_cd2_115_path(self._closed_loop_old_movie_library_path).rstrip("/")
+            return self._to_cd2_115_path(self._closed_loop_movie_library_path).rstrip("/")
+        if media_category == "archive":
+            return self._to_cd2_115_path(self._closed_loop_archive_library_path).rstrip("/")
+        return self._to_cd2_115_path(self._closed_loop_ongoing_library_path).rstrip("/")
+
+    def _closed_loop_available_for_subscription(self, subscription: dict) -> bool:
+        """闭环整理是否可以接管当前订阅。"""
+        if not self._closed_loop_organize_enabled:
+            return False
+        if not self._cd2_host or not (self._cd2_token or (self._cd2_username and self._cd2_password)):
+            logger.warning("【115助手】插件闭环整理已开启，但 CD2 未配置，回退 MP 原生整理")
+            return False
+        if not self._get_closed_loop_library_path(subscription):
+            logger.warning(
+                f"【115助手】{subscription.get('title')} 未配置闭环正式库目录，回退 MP 原生整理"
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _to_cd2_115_path(path: str) -> str:
+        """把 115 Web API 路径转换成 CD2 挂载路径。"""
+        path = str(path or "").strip()
+        if not path:
+            return ""
+        if path.startswith("/115/") or path == "/115":
+            return path
+        if path.startswith("/"):
+            return f"/115{path}"
+        return f"/115/{path}"
+
+    def _pending_staging_path_to_cd2_path(self, subscription: dict, web_path: str) -> str:
+        """
+        将待入库扫描得到的 115 Web 路径映射回 CD2 路径。
+        优先使用用户配置的 115 目标目录作为 CD2 根，避免硬编码 /115。
+        """
+        web_path = str(web_path or "").strip()
+        if not web_path:
+            return ""
+        cd2_root = self._get_115_target_path(subscription).rstrip("/")
+        mp_root = self._get_mp_staging_path(subscription).rstrip("/")
+        if cd2_root and mp_root:
+            normalized_web = web_path.rstrip("/")
+            normalized_root = mp_root.rstrip("/")
+            if normalized_web == normalized_root:
+                return cd2_root
+            prefix = f"{normalized_root}/"
+            if normalized_web.startswith(prefix):
+                rel_path = normalized_web[len(prefix):].lstrip("/")
+                return f"{cd2_root}/{rel_path}" if rel_path else cd2_root
+        return self._to_cd2_115_path(web_path)
+
+    @staticmethod
+    def _safe_path_name(value: Any, fallback: str = "Unknown") -> str:
+        """清洗路径片段，避免云盘路径里出现非法字符。"""
+        text = str(value or "").strip()
+        text = re.sub(r'[\\/:*?"<>|]', "_", text)
+        text = re.sub(r"\s+", " ", text).strip(" ._")
+        return text or fallback
+
+    def _closed_loop_show_dir_name(self, subscription: dict, mediainfo: Any = None) -> str:
+        title = (
+            getattr(mediainfo, "title", None)
+            or getattr(mediainfo, "name", None)
+            or subscription.get("title")
+            or "Unknown"
+        )
+        year = getattr(mediainfo, "year", None) or subscription.get("year")
+        base = self._safe_path_name(title)
+        return f"{base} ({year})" if year else base
+
+    def _closed_loop_episode_filename(
+        self,
+        subscription: dict,
+        source_name: str,
+        season: int,
+        episodes: List[int],
+        mediainfo: Any = None,
+    ) -> str:
+        """生成与 MP 本体默认模板接近的剧集文件名。"""
+        ext = Path(source_name or "").suffix
+        root = Path(source_name or "").stem
+        title = (
+            getattr(mediainfo, "title", None)
+            or getattr(mediainfo, "name", None)
+            or subscription.get("title")
+            or "Unknown"
+        )
+        safe_title = self._safe_path_name(title)
+        cleaned_eps = sorted({int(ep) for ep in episodes if ep is not None})
+        if len(cleaned_eps) == 1:
+            ep_tag = f"E{cleaned_eps[0]:02d}"
+        elif cleaned_eps:
+            ep_tag = f"E{cleaned_eps[0]:02d}-E{cleaned_eps[-1]:02d}"
+        else:
+            ep = self._parse_episode_number(source_name or "")
+            ep_tag = f"E{ep:02d}" if ep is not None else "E00"
+
+        season_episode = f"S{int(season or 1):02d}{ep_tag}"
+        if len(cleaned_eps) == 1:
+            canonical = f"{safe_title} - {season_episode} - 第 {cleaned_eps[0]} 集"
+        else:
+            canonical = f"{safe_title} - {season_episode}"
+
+        raw_year = getattr(mediainfo, "year", None) or subscription.get("year")
+        year_text = ""
+        if raw_year:
+            try:
+                year_text = str(int(raw_year))
+            except (TypeError, ValueError):
+                year_text = str(raw_year).strip()
+        suffix = root.strip()
+        suffix = re.sub(r"\{tmdb-\d+\}", "", suffix, flags=re.IGNORECASE).strip(" ._-")
+        title_pattern = re.escape(safe_title).replace(r"\ ", r"[\s._-]+")
+        cleanup_patterns = []
+        if year_text:
+            cleanup_patterns.extend([
+                rf"^{title_pattern}[\s._-]*(?:\({re.escape(year_text)}\)|{re.escape(year_text)})[\s._-]*",
+                rf"^(?:\({re.escape(year_text)}\)|{re.escape(year_text)})[\s._-]*",
+            ])
+        cleanup_patterns.extend([
+            rf"^{title_pattern}[\s._-]*",
+            rf"^[Ss]{int(season or 1):02d}\s*[\.\-_\s]?\s*{ep_tag}\s*[\s\._\-~]*",
+            rf"^[Ss]{int(season or 1)}\s*[\.\-_\s]?\s*{ep_tag}\s*[\s\._\-~]*",
+            r"^第\s*\d+\s*[集话話]\s*[\s\._\-~]*",
+            r"^[Ee][Pp]?\d{1,3}\b\s*[\s\._\-]*",
+            r"^\d{1,3}(?:[\s\._\-~]+|$)\s*",
+        ])
+        for pattern in cleanup_patterns:
+            new_suffix = re.sub(pattern, "", suffix, count=1, flags=re.IGNORECASE).strip(" ._-")
+            if new_suffix != suffix:
+                suffix = new_suffix
+        suffix = re.sub(r"^第\s*\d+\s*[集话話]\s*[\s\._\-~]*", "", suffix).strip(" ._-")
+        for pattern in (
+            r'^[Ss]\d+\s*[\.\-_\s]?\s*[Ee]\d+(?:\s*-\s*[Ee]?\d+)?\s*[\s\._\-~]*',
+            r'^[Ee][Pp]?\d{1,3}\b\s*[\s\._\-]*',
+            r'^第\d+[集话話]\s*[\s\._\-]*',
+            r'^\d{1,3}(?:[\s\._\-~]+|$)\s*',
+        ):
+            new_suffix = re.sub(pattern, "", suffix, count=1, flags=re.IGNORECASE).strip(" ._-")
+            if new_suffix != suffix:
+                suffix = new_suffix
+                break
+        if suffix.lower().startswith(safe_title.lower()):
+            suffix = suffix[len(safe_title):].strip(" ._-")
+
+        name = canonical
+        if suffix:
+            name = f"{name} - {self._safe_path_name(suffix)}"
+        return f"{name}{ext}"
+
+    def _ensure_cd2_dir(self, cd2, path: str) -> bool:
+        """递归确保 CD2 目录存在，第一段为挂载根，只验证不创建。"""
+        path = str(path or "").strip().rstrip("/")
+        if not path or path == "/":
+            return True
+        parts = [part for part in path.split("/") if part]
+        if not parts:
+            return True
+
+        current = f"/{parts[0]}"
+        items = cd2.list_dir(current, force_refresh=True)
+        if getattr(cd2, "last_error", ""):
+            logger.warning(f"【115助手】闭环整理无法访问 CD2 根目录: {current} | {cd2.last_error}")
+            return False
+
+        for part in parts[1:]:
+            found = next(
+                (item for item in (items or []) if item.get("is_dir") and item.get("name") == part),
+                None,
+            )
+            next_path = f"{current}/{part}"
+            if not found:
+                if not cd2.create_folder(current, part):
+                    logger.warning(f"【115助手】闭环整理创建目录失败: {next_path}")
+                    return False
+                logger.info(f"【115助手】闭环整理创建目录: {next_path}")
+                current = next_path
+            else:
+                current = found.get("path") or next_path
+            items = cd2.list_dir(current, force_refresh=True)
+            if getattr(cd2, "last_error", ""):
+                logger.warning(f"【115助手】闭环整理读取目录失败: {current} | {cd2.last_error}")
+                return False
+        return True
+
+    def _closed_loop_history_key(
+        self,
+        tmdb_id: Optional[int],
+        media_type_str: str,
+        season: Optional[int],
+    ) -> str:
+        media_id = str(tmdb_id or "unknown")
+        season_part = "movie" if media_type_str == "电影" else f"S{int(season or 1):02d}"
+        return f"{media_type_str}|{media_id}|{season_part}"
+
+    def _get_closed_loop_organized_episodes(
+        self,
+        tmdb_id: Optional[int],
+        media_type_str: str,
+        season: Optional[int],
+    ) -> List[int]:
+        state = self._load_runtime_state()
+        history = state.get(self._CLOSED_LOOP_HISTORY_KEY)
+        if not isinstance(history, dict):
+            return []
+        key = self._closed_loop_history_key(tmdb_id, media_type_str, season)
+        item = history.get(key)
+        if not isinstance(item, dict):
+            return []
+        if media_type_str == "电影":
+            return [-1] if item.get("movie_exists") else []
+        episodes = set()
+        for ep in item.get("episodes") or []:
+            try:
+                episodes.add(int(ep))
+            except (TypeError, ValueError):
+                continue
+        return sorted(episodes)
+
+    def _append_closed_loop_organized_records(
+        self,
+        subscription: dict,
+        records: List[dict],
+    ) -> None:
+        """记录插件闭环入库账本，用于后续缺集判断和防重复通知。"""
+        if not records:
+            return
+        state = self._load_runtime_state()
+        history = state.get(self._CLOSED_LOOP_HISTORY_KEY)
+        if not isinstance(history, dict):
+            history = {}
+            state[self._CLOSED_LOOP_HISTORY_KEY] = history
+
+        media_type_str = subscription.get("media_type", "电视剧")
+        season = subscription.get("season") or 1
+        key = self._closed_loop_history_key(subscription.get("tmdb_id"), media_type_str, season)
+        item = history.get(key)
+        if not isinstance(item, dict):
+            item = {
+                "title": subscription.get("title"),
+                "year": subscription.get("year"),
+                "tmdb_id": subscription.get("tmdb_id"),
+                "media_type": media_type_str,
+                "season": season,
+                "episodes": [],
+                "files": [],
+            }
+            history[key] = item
+
+        if media_type_str == "电影":
+            item["movie_exists"] = True
+        else:
+            episodes = set()
+            for ep in item.get("episodes") or []:
+                try:
+                    episodes.add(int(ep))
+                except (TypeError, ValueError):
+                    continue
+            for record in records:
+                for ep in record.get("episodes") or []:
+                    try:
+                        episodes.add(int(ep))
+                    except (TypeError, ValueError):
+                        continue
+            item["episodes"] = sorted(episodes)
+
+        files = item.get("files")
+        if not isinstance(files, list):
+            files = []
+        seen_paths = {str(file.get("target_path") or "") for file in files if isinstance(file, dict)}
+        for record in records:
+            target_path = str(record.get("target_path") or "")
+            if target_path and target_path in seen_paths:
+                continue
+            files.append({
+                "name": record.get("name"),
+                "source_path": record.get("source_path"),
+                "target_path": target_path,
+                "size": record.get("size"),
+                "episodes": record.get("episodes") or [],
+                "organized_at": datetime.now().isoformat(),
+            })
+            if target_path:
+                seen_paths.add(target_path)
+        item["files"] = files[-200:]
+        item["updated_at"] = datetime.now().isoformat()
+        self._save_runtime_state()
+
+    @staticmethod
+    def _bytes_from_metadata(value: Any) -> Optional[bytes]:
+        if value is None:
+            return None
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, bytearray):
+            return bytes(value)
+        return str(value).encode("utf-8")
+
+    def _download_metadata_image(self, url: str) -> Optional[bytes]:
+        if not url:
+            return None
+        try:
+            with httpx.Client(timeout=25.0, follow_redirects=True) as client:
+                resp = client.get(str(url))
+                resp.raise_for_status()
+                return resp.content
+        except Exception as e:
+            logger.debug(f"【115助手】下载刮削图片失败: {url} | {e}")
+            return None
+
+    def _write_closed_loop_metadata(
+        self,
+        cd2,
+        subscription: dict,
+        show_dir: str,
+        season_dir: str,
+        records: List[dict],
+        mediainfo: Any,
+        meta: Any,
+    ) -> None:
+        """写入基础 NFO/海报；不写每集海报。"""
+        if not self._closed_loop_scrape_metadata or not records or not mediainfo or not meta:
+            return
+
+        try:
+            media_chain = MediaChain()
+        except Exception as e:
+            logger.warning(f"【115助手】闭环刮削初始化失败: {e}")
+            return
+
+        season = int(subscription.get("season") or 1)
+        try:
+            tv_nfo = self._bytes_from_metadata(
+                media_chain.metadata_nfo(meta=meta, mediainfo=mediainfo)
+            )
+            if tv_nfo:
+                cd2.write_file_bytes(show_dir, "tvshow.nfo", tv_nfo, overwrite=False)
+        except Exception as e:
+            logger.debug(f"【115助手】写入 tvshow.nfo 失败: {e}")
+
+        try:
+            season_nfo = self._bytes_from_metadata(
+                media_chain.metadata_nfo(meta=meta, mediainfo=mediainfo, season=season)
+            )
+            if season_nfo:
+                cd2.write_file_bytes(season_dir, "season.nfo", season_nfo, overwrite=False)
+        except Exception as e:
+            logger.debug(f"【115助手】写入 season.nfo 失败: {e}")
+
+        for record in records:
+            record_eps = sorted({int(ep) for ep in (record.get("episodes") or []) if ep is not None})
+            target_name = Path(str(record.get("target_path") or record.get("name") or "")).name
+            if len(record_eps) != 1 or not target_name:
+                continue
+            ep_num = record_eps[0]
+            try:
+                ep_meta = ParseMeta(
+                    f"{subscription.get('title', '')} S{season:02d}E{ep_num:02d}"
+                )
+                ep_meta.type = MediaType.TV
+                ep_meta.begin_season = season
+                ep_meta.begin_episode = ep_num
+                episode_nfo = self._bytes_from_metadata(
+                    media_chain.metadata_nfo(
+                        meta=ep_meta,
+                        mediainfo=mediainfo,
+                        season=season,
+                        episode=ep_num,
+                    )
+                )
+                if episode_nfo:
+                    cd2.write_file_bytes(
+                        season_dir,
+                        f"{Path(target_name).stem}.nfo",
+                        episode_nfo,
+                        overwrite=False,
+                    )
+            except Exception as e:
+                logger.debug(f"【115助手】写入 E{ep_num:02d} nfo 失败: {e}")
+
+        def _write_images(image_map: dict, parent_path: str, season_scope: bool = False) -> None:
+            if not isinstance(image_map, dict):
+                return
+            for image_name, image_url in image_map.items():
+                image_name = str(image_name or "").strip()
+                if not image_name or not image_url:
+                    continue
+                image_bytes = self._download_metadata_image(str(image_url))
+                if not image_bytes:
+                    continue
+                cd2.write_file_bytes(parent_path, image_name, image_bytes, overwrite=False)
+
+                lower = image_name.lower()
+                ext = Path(image_name).suffix or ".jpg"
+                if lower.startswith("backdrop."):
+                    cd2.write_file_bytes(parent_path, f"fanart{ext}", image_bytes, overwrite=False)
+                if lower.startswith("thumb."):
+                    cd2.write_file_bytes(parent_path, f"landscape{ext}", image_bytes, overwrite=False)
+
+                if season_scope and lower.startswith("season") and "-poster" in lower:
+                    cd2.write_file_bytes(season_dir, f"poster{ext}", image_bytes, overwrite=False)
+
+        try:
+            _write_images(media_chain.metadata_img(mediainfo=mediainfo) or {}, show_dir)
+        except Exception as e:
+            logger.debug(f"【115助手】写入剧集海报失败: {e}")
+
+        try:
+            _write_images(
+                media_chain.metadata_img(mediainfo=mediainfo, season=season) or {},
+                show_dir,
+                season_scope=True,
+            )
+        except Exception as e:
+            logger.debug(f"【115助手】写入季海报失败: {e}")
+
+    def _organize_pending_subscription_closed_loop(
+        self,
+        subscription: dict,
+        files: List[dict],
+        pending_episodes: List[int],
+        before_existing: set,
+    ) -> Optional[int]:
+        """插件闭环整理：直接通过 CD2 移动/重命名到正式媒体库。"""
+        if not self._closed_loop_available_for_subscription(subscription):
+            return None
+
+        media_type_str = subscription.get("media_type", "电视剧")
+        if media_type_str == "电影":
+            logger.info("【115助手】电影闭环整理暂未接管，回退 MP 原生整理")
+            return None
+
+        title = subscription.get("title", "")
+        season = int(subscription.get("season") or 1)
+        library_root = self._get_closed_loop_library_path(subscription)
+
+        try:
+            cd2 = self._build_cd2_client()
+        except Exception as e:
+            logger.warning(f"【115助手】闭环整理初始化 CD2 失败: {e}")
+            return 0
+        if not cd2.test_connection():
+            logger.warning(f"【115助手】闭环整理 CD2 连接失败: {self._format_cd2_connection_error(cd2)}")
+            return 0
+
+        sample_name = files[0].get("name", "") if files else title
+        meta, mediainfo = self._build_notification_media_context(
+            subscription,
+            pending_episodes,
+            sample_name,
+        )
+        show_dir_name = self._closed_loop_show_dir_name(subscription, mediainfo)
+        show_dir = f"{library_root.rstrip('/')}/{show_dir_name}"
+        if not self._ensure_cd2_dir(cd2, show_dir):
+            subscription["pending_copy_status"] = "closed_loop_target_missing"
+            subscription["pending_last_error"] = f"闭环整理无法创建剧集目录: {show_dir}"
+            return 0
+        season_dir = self._find_or_create_season_dir(cd2, show_dir, season)
+        if not self._ensure_cd2_dir(cd2, season_dir):
+            subscription["pending_copy_status"] = "closed_loop_target_missing"
+            subscription["pending_last_error"] = f"闭环整理无法创建季目录: {season_dir}"
+            return 0
+
+        moved_records: List[dict] = []
+        pending_set = set(pending_episodes)
+        for item in files:
+            name = item.get("name", "")
+            source_path = item.get("path", "")
+            if not name or not source_path:
+                continue
+            item_eps_set = set()
+            for ep in item.get("episodes") or []:
+                try:
+                    ep_num = int(ep)
+                except (TypeError, ValueError):
+                    continue
+                if ep_num in pending_set:
+                    item_eps_set.add(ep_num)
+            item_eps = sorted(item_eps_set)
+            if not item_eps:
+                ep = self._parse_episode_number(name) or self._parse_episode_number(source_path)
+                item_eps = [ep] if ep and ep in pending_set else []
+            if not item_eps:
+                logger.info(f"【115助手】闭环整理跳过无法确认集数的文件: {name}")
+                continue
+
+            new_name = self._closed_loop_episode_filename(
+                subscription=subscription,
+                source_name=name,
+                season=season,
+                episodes=item_eps,
+                mediainfo=mediainfo,
+            )
+            src_cd2_path = self._pending_staging_path_to_cd2_path(subscription, source_path)
+            moved_paths = cd2.move_file([src_cd2_path], season_dir, conflict_policy="Rename")
+            if not moved_paths:
+                attempts = int(subscription.get("pending_organize_attempts") or 0) + 1
+                subscription["pending_organize_attempts"] = attempts
+                subscription["pending_copy_status"] = "closed_loop_move_failed"
+                subscription["pending_last_error"] = f"闭环整理移动失败: {src_cd2_path}"
+                logger.warning(f"【115助手】闭环整理移动失败: {src_cd2_path} -> {season_dir}")
+                continue
+
+            moved_path = moved_paths[0]
+            final_path = moved_path
+            if Path(moved_path).name != new_name:
+                if cd2.rename_file(moved_path, new_name):
+                    final_path = str(PurePosixPath(moved_path).with_name(new_name))
+                else:
+                    logger.warning(f"【115助手】闭环整理重命名失败，保留原名: {moved_path}")
+
+            record = {
+                "title": title,
+                "year": subscription.get("year"),
+                "tmdb_id": subscription.get("tmdb_id"),
+                "media_type": media_type_str,
+                "category": subscription.get("media_category"),
+                "season": season,
+                "episodes": item_eps,
+                "source_files": [{
+                    "name": new_name,
+                    "path": final_path,
+                    "size": int(item.get("size", 0) or 0),
+                    "episodes": item_eps,
+                }],
+                "source_path": source_path,
+                "target_path": final_path,
+                "name": new_name,
+                "size": int(item.get("size", 0) or 0),
+            }
+            moved_records.append(record)
+            logger.info(
+                f"【115助手】闭环整理入库: {source_path} -> {final_path} "
+                f"({self._format_episode_preview(item_eps)})"
+            )
+            time.sleep(0.5)
+
+        moved_episodes = sorted({
+            int(ep)
+            for record in moved_records
+            for ep in (record.get("episodes") or [])
+            if ep is not None
+        })
+        if not moved_episodes:
+            return 0
+
+        self._write_closed_loop_metadata(
+            cd2=cd2,
+            subscription=subscription,
+            show_dir=show_dir,
+            season_dir=season_dir,
+            records=moved_records,
+            mediainfo=mediainfo,
+            meta=meta,
+        )
+        self._append_closed_loop_organized_records(subscription, moved_records)
+
+        refreshed = self._refresh_cd2_watch_mediaservers(moved_records)
+        if refreshed:
+            logger.info(f"【115助手】闭环整理已请求局部刷新媒体库: {', '.join(refreshed)}")
+
+        refreshed_existing = sorted(set(before_existing) | set(moved_episodes))
+        remaining = sorted(set(pending_episodes) - set(refreshed_existing))
+        subscription["_cache_existing_count"] = len(refreshed_existing)
+        subscription["_cache_existing_episodes"] = refreshed_existing
+        cache_key = self._existing_episodes_cache_key(
+            title,
+            subscription.get("tmdb_id"),
+            media_type_str,
+            season,
+        )
+        self._set_existing_episodes_cache(cache_key, refreshed_existing)
+        if remaining:
+            subscription["pending_copy_episodes"] = remaining
+            self._prune_pending_source_records(subscription, remaining)
+            subscription["_cache_pending_count"] = len(remaining)
+            subscription["_cache_pending_episodes"] = remaining
+            subscription["_cache_pending_since"] = subscription.get("pending_copy_since", "")
+            subscription["pending_copy_status"] = "closed_loop_partial"
+            subscription["pending_last_error"] = f"闭环整理后仍待入库: {remaining}"
+        else:
+            subscription.pop("pending_copy_episodes", None)
+            subscription.pop("pending_copy_files", None)
+            subscription.pop("pending_copy_since", None)
+            subscription.pop("pending_copy_status", None)
+            subscription.pop("pending_organize_attempts", None)
+            subscription.pop("pending_last_error", None)
+            subscription["_cache_pending_count"] = 0
+            subscription["_cache_pending_episodes"] = []
+            subscription["_cache_pending_since"] = ""
+
+        if self._notify:
+            notice_source_files = [
+                {
+                    "name": record.get("name"),
+                    "path": record.get("target_path"),
+                    "size": record.get("size") or 0,
+                    "episodes": record.get("episodes") or [],
+                }
+                for record in moved_records
+            ]
+            self._post_organize_success_template_message(
+                subscription=subscription,
+                episodes=moved_episodes,
+                source_files=notice_source_files,
+                reason="115 入库确认",
+            )
+
+        subscription["_cache_updated"] = datetime.now().isoformat()
+        return len(moved_records)
+
     def _organize_pending_subscription(
         self,
         subscription: dict,
@@ -6072,6 +8179,35 @@ function startPolling() {
         if not pending_episodes:
             return 0
 
+        total_episodes = None
+        try:
+            total_episodes = int(subscription.get("_cache_total_episodes") or 0) or None
+        except (TypeError, ValueError):
+            total_episodes = None
+        if media_type_str != "电影" and not total_episodes:
+            total_episodes = self._get_total_episodes(title, tmdb_id, media_type_str, season)
+            if total_episodes:
+                subscription["_cache_total_episodes"] = total_episodes
+        if media_type_str != "电影" and total_episodes:
+            capped_values = set()
+            for ep in pending_episodes:
+                try:
+                    ep_num = int(ep)
+                except (TypeError, ValueError):
+                    continue
+                if 0 < ep_num <= int(total_episodes):
+                    capped_values.add(ep_num)
+            capped_pending = sorted(capped_values)
+            if len(capped_pending) != len(set(pending_episodes)):
+                logger.warning(
+                    f"【115助手】{title} pending 集数超过 TMDB 总集数 {total_episodes}，"
+                    f"本轮仅处理: {capped_pending}"
+                )
+                subscription["pending_copy_episodes"] = capped_pending
+                subscription["_cache_pending_count"] = len(capped_pending)
+                subscription["_cache_pending_episodes"] = capped_pending
+            pending_episodes = capped_pending
+
         cached_existing = subscription.get("_cache_existing_episodes") or []
         real_existing = set(
             self._get_existing_episodes(
@@ -6080,6 +8216,7 @@ function startPolling() {
                 media_type_str,
                 season,
                 cached_episodes=cached_existing,
+                total_episodes=total_episodes,
             )
         )
         before_existing = set(real_existing)
@@ -6087,6 +8224,7 @@ function startPolling() {
         if not pending_episodes:
             logger.info(f"【115助手】{title} 待入库集数已全部入库，清除 pending 标记")
             subscription.pop("pending_copy_episodes", None)
+            subscription.pop("pending_copy_files", None)
             subscription.pop("pending_copy_since", None)
             subscription.pop("pending_copy_status", None)
             subscription.pop("pending_organize_attempts", None)
@@ -6107,6 +8245,15 @@ function startPolling() {
                 f"Cookie来源={cookie_source}，attempts={attempts}"
             )
             return 0
+
+        closed_loop_result = self._organize_pending_subscription_closed_loop(
+            subscription=subscription,
+            files=files,
+            pending_episodes=pending_episodes,
+            before_existing=before_existing,
+        )
+        if closed_loop_result is not None:
+            return closed_loop_result
 
         try:
             from app.chain.transfer import TransferChain
@@ -6171,6 +8318,7 @@ function startPolling() {
                 season,
                 force_refresh=True,
                 cached_episodes=subscription.get("_cache_existing_episodes") or [],
+                total_episodes=total_episodes,
             )
         )
         newly_existing = sorted(refreshed_existing - before_existing)
@@ -6179,6 +8327,7 @@ function startPolling() {
         subscription["_cache_existing_episodes"] = sorted(refreshed_existing)
         if remaining:
             subscription["pending_copy_episodes"] = remaining
+            self._prune_pending_source_records(subscription, remaining)
             subscription["_cache_pending_count"] = len(remaining)
             subscription["_cache_pending_episodes"] = remaining
             subscription["_cache_pending_since"] = subscription.get("pending_copy_since", "")
@@ -6187,6 +8336,7 @@ function startPolling() {
                 subscription["pending_last_error"] = f"仍待入库: {remaining}"
         else:
             subscription.pop("pending_copy_episodes", None)
+            subscription.pop("pending_copy_files", None)
             subscription.pop("pending_copy_since", None)
             subscription.pop("pending_copy_status", None)
             subscription.pop("pending_organize_attempts", None)
@@ -6194,21 +8344,17 @@ function startPolling() {
             subscription["_cache_pending_count"] = 0
             subscription["_cache_pending_episodes"] = []
             subscription["_cache_pending_since"] = ""
-        if newly_existing and self._notify:
-            notice_episodes, skipped_episodes = self._filter_plugin_notice_episodes(
-                subscription, newly_existing
+        if newly_existing:
+            self._refresh_subscription_mediaservers(
+                subscription=subscription,
+                episodes=newly_existing,
             )
-            if skipped_episodes:
-                logger.info(
-                    f"【115助手】{title} 待入库重试结果已有 MP 整理历史，跳过插件补通知: "
-                    f"{self._format_episode_preview(skipped_episodes)}"
-                )
-            if notice_episodes:
+            if self._notify:
                 self._post_organize_success_template_message(
                     subscription=subscription,
-                    episodes=notice_episodes,
+                    episodes=newly_existing,
                     source_files=files,
-                    reason="待入库重试确认 115 入库",
+                    reason="115 入库确认",
                 )
         subscription["_cache_updated"] = datetime.now().isoformat()
         return submitted
@@ -6335,12 +8481,86 @@ function startPolling() {
                 subscription.get("season"),
             )
         )
-        if not history_episodes:
+        history_episodes.update(
+            self._get_closed_loop_organized_episodes(
+                subscription.get("tmdb_id"),
+                media_type_str,
+                subscription.get("season"),
+            )
+        )
+        sent_map = self._load_plugin_notice_sent_map()
+        sent_episodes = {
+            ep
+            for ep in cleaned
+            if self._plugin_notice_episode_key(subscription, ep) in sent_map
+        }
+        if sent_episodes:
+            logger.info(
+                f"【115助手】{subscription.get('title')} 插件通知账本已记录，跳过重复通知: "
+                f"{self._format_episode_preview(sorted(sent_episodes))}"
+            )
+        if not history_episodes and not sent_episodes:
             return cleaned, []
 
-        skipped = sorted(set(cleaned) & history_episodes)
-        notice = [ep for ep in cleaned if ep not in history_episodes]
+        skipped = sorted((set(cleaned) & history_episodes) | sent_episodes)
+        notice = [ep for ep in cleaned if ep not in set(skipped)]
         return notice, skipped
+
+    def _build_subscription_refresh_records(
+        self,
+        subscription: dict,
+        episodes: List[int],
+    ) -> List[dict]:
+        """Build media-server refresh records from the final library paths in MP history."""
+        cleaned = sorted({int(ep) for ep in episodes if ep is not None})
+        notice_files = self._collect_notice_files_from_history(
+            tmdb_id=subscription.get("tmdb_id"),
+            media_type_str=subscription.get("media_type", "电视剧"),
+            season=subscription.get("season"),
+            episodes=cleaned,
+        )
+        if not notice_files:
+            return []
+
+        records = []
+        for item in notice_files:
+            target_path = item.get("path")
+            if not target_path:
+                continue
+            records.append({
+                "title": subscription.get("title"),
+                "year": subscription.get("year"),
+                "tmdb_id": subscription.get("tmdb_id"),
+                "media_type": subscription.get("media_type", "电视剧"),
+                "category": subscription.get("media_category"),
+                "season": int(subscription.get("season") or 1),
+                "episodes": item.get("episodes") or cleaned,
+                "source_files": [item],
+                "target_path": target_path,
+            })
+        return records
+
+    def _refresh_subscription_mediaservers(
+        self,
+        subscription: dict,
+        episodes: List[int],
+    ) -> List[str]:
+        """Refresh media servers for files just organized by the 115 helper."""
+        records = self._build_subscription_refresh_records(subscription, episodes)
+        if not records:
+            logger.info(
+                f"【115助手】{subscription.get('title')} 未找到整理历史目标路径，跳过媒体库局部刷新"
+            )
+            return []
+
+        refreshed = self._refresh_cd2_watch_mediaservers(records)
+        if refreshed:
+            logger.info(
+                f"【115助手】{subscription.get('title')} 已请求局部刷新媒体库: {', '.join(refreshed)}"
+            )
+        else:
+            logger.info(f"【115助手】{subscription.get('title')} 未触发可用媒体库局部刷新")
+        return refreshed
 
     def _summarize_notice_files(
         self,
@@ -6413,6 +8633,29 @@ function startPolling() {
         fallback_meta = None
         fallback_media = None
         media_chain = MediaChain()
+        if expected_tmdb:
+            try:
+                direct_title = title_candidate or title or (Path(sample_name).stem if sample_name else "")
+                direct_meta = ParseMeta(direct_title or str(expected_tmdb))
+                if season:
+                    direct_meta.begin_season = int(season)
+                if first_ep:
+                    direct_meta.begin_episode = int(first_ep)
+                direct_meta.type = MediaType.MOVIE if media_type_str == "电影" else MediaType.TV
+                direct_media = media_chain.recognize_media(
+                    meta=direct_meta,
+                    mtype=direct_meta.type,
+                    tmdbid=expected_tmdb,
+                )
+                if direct_media:
+                    try:
+                        media_chain.obtain_images(mediainfo=direct_media)
+                    except Exception as image_err:
+                        logger.debug(f"【115助手】补全入库通知图片失败: TMDB={expected_tmdb} | {image_err}")
+                    return direct_meta, direct_media
+            except Exception as e:
+                logger.debug(f"【115助手】按 TMDB 构造入库通知媒体上下文失败: TMDB={expected_tmdb} | {e}")
+
         for candidate in dict.fromkeys(candidates):
             try:
                 meta = ParseMeta(candidate)
@@ -6421,7 +8664,12 @@ function startPolling() {
                 if first_ep:
                     meta.begin_episode = int(first_ep)
                 meta.type = MediaType.MOVIE if media_type_str == "电影" else MediaType.TV
-                mediainfo = media_chain.recognize_by_meta(meta, obtain_images=True)
+                mediainfo = media_chain.recognize_by_meta(meta)
+                if mediainfo:
+                    try:
+                        media_chain.obtain_images(mediainfo=mediainfo)
+                    except Exception as image_err:
+                        logger.debug(f"【115助手】补全入库通知图片失败: {candidate} | {image_err}")
                 if not fallback_meta:
                     fallback_meta = meta
                     fallback_media = mediainfo
@@ -6446,12 +8694,14 @@ function startPolling() {
         source_files: Optional[List[dict]] = None,
         reason: str = "",
         source_label: str = "115入库",
-    ) -> None:
+        season_episode_override: Optional[str] = None,
+        mark_notice: bool = True,
+    ) -> bool:
         """使用 MP 原生“整理入库成功”模板发送 115 入库确认通知。"""
         cleaned = sorted({int(ep) for ep in episodes if ep is not None})
         media_type_str = subscription.get("media_type", "电视剧")
         if media_type_str != "电影" and not cleaned:
-            return
+            return False
 
         title = subscription.get("title", "")
         tmdb_id = subscription.get("tmdb_id")
@@ -6468,7 +8718,7 @@ function startPolling() {
 
         file_count, total_size, sample_name = self._summarize_notice_files(cleaned, notice_files)
         meta, mediainfo = self._build_notification_media_context(subscription, cleaned, sample_name)
-        season_episode = (
+        season_episode = season_episode_override or (
             self._format_system_season_episode(season, cleaned)
             if media_type_str != "电影"
             else None
@@ -6488,7 +8738,9 @@ function startPolling() {
                 ),
                 text=text,
             )
-            return
+            if mark_notice:
+                self._mark_plugin_notice_sent(subscription, cleaned)
+            return True
 
         transferinfo = TransferInfo(
             file_count=file_count,
@@ -6511,6 +8763,9 @@ function startPolling() {
             f"【115助手】{title} 已按 MP 入库模板发送通知: "
             f"{season_episode or 'MOVIE'}, files={file_count}, size={total_size}, source={source_label}"
         )
+        if mark_notice:
+            self._mark_plugin_notice_sent(subscription, cleaned)
+        return True
 
     def _notify_token_expired(self, source: str, detail: str = "") -> None:
         """
@@ -6711,35 +8966,79 @@ function startPolling() {
 
         return ranked
 
+    _KEYCAP_DIGIT_PATTERN = re.compile(r"([0-9])\ufe0f?\u20e3")
+    _TITLE_DIGIT_TO_CN = str.maketrans({
+        "0": "零",
+        "1": "一",
+        "2": "二",
+        "3": "三",
+        "4": "四",
+        "5": "五",
+        "6": "六",
+        "7": "七",
+        "8": "八",
+        "9": "九",
+    })
+
+    @classmethod
+    def _normalize_confusable_title_text(cls, text: str) -> str:
+        """归一化标题匹配里的混淆数字，如 老9️⃣门 -> 老九门。"""
+        normalized = unicodedata.normalize("NFKC", str(text or ""))
+        normalized = cls._KEYCAP_DIGIT_PATTERN.sub(r"\1", normalized)
+        normalized = normalized.replace("\ufe0f", "").replace("\u20e3", "")
+        normalized = normalized.translate(cls._TITLE_DIGIT_TO_CN)
+        return normalized
+
     @staticmethod
-    def _result_definitely_off_topic(result: dict, subscription: dict) -> bool:
-        """过滤标题党、在线观影页、课程等明显不是目标剧资源的搜索结果。"""
-        title = str(subscription.get("title") or "").strip()
-        if not title:
+    def _short_title_embedded_in_other_chinese_text(compact: str, title_compact: str) -> bool:
+        """短中文标题被其它中文标题包住时判为串剧，如「九门」命中「老九门」。"""
+        if not compact or not title_compact:
+            return False
+        chinese_only_title = re.sub(r"[^\u4e00-\u9fff]", "", title_compact)
+        if not (0 < len(chinese_only_title) <= 3):
             return False
 
-        text = " ".join(
-            str(result.get(key, "") or "")
-            for key in ("note", "name", "title", "url")
-        )
-        compact = re.sub(r"\s+", "", text)
-        title_compact = re.sub(r"\s+", "", title)
-        if title_compact and title_compact not in compact:
+        allowed_next_context = set("第更更新至全共完已连集话話季")
+        for match in re.finditer(re.escape(title_compact), compact):
+            start, end = match.span()
+            prev_char = compact[start - 1] if start > 0 else ""
+            next_char = compact[end] if end < len(compact) else ""
+            if prev_char and re.match(r"[\u4e00-\u9fff]", prev_char):
+                return True
+            if (
+                next_char
+                and re.match(r"[\u4e00-\u9fff]", next_char)
+                and next_char not in allowed_next_context
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _subscription_title_match_state(cls, text: str, subscription: dict) -> Optional[bool]:
+        """
+        判断文本里的标题命中是否可信。
+
+        返回值：
+        - True：明确命中订阅标题
+        - False：标题只是短词子串，疑似命中别的剧名
+        - None：文本未出现订阅标题，调用方按上下文决定是否放行
+        """
+        title = str(subscription.get("title") or "").strip()
+        if not title:
             return True
 
-        # 这些通常是在线播放/课程营销页，不是可转存的网盘剧集文件。
-        noise_tokens = (
-            "在线观看", "免费在线观看", "无广告在线", "超清免费在线观看",
-            "vs影视", "口语", "英语", "课程", "亲授", "老师", "电台",
-            "社交", "旅行", "达人", "教学理念",
-        )
-        compact_lower = compact.lower()
-        if any(token in compact_lower for token in noise_tokens):
+        compact = re.sub(r"\s+", "", cls._normalize_confusable_title_text(text))
+        title_compact = re.sub(r"\s+", "", cls._normalize_confusable_title_text(title))
+        if not title_compact:
             return True
+        if title_compact not in compact:
+            return None
 
-        # 短中文标题容易作为普通词出现，例如“行业翘楚”。要求它出现在剧名语境里。
         chinese_only_title = re.sub(r"[^\u4e00-\u9fff]", "", title_compact)
         if 0 < len(chinese_only_title) <= 3:
+            if cls._short_title_embedded_in_other_chinese_text(compact, title_compact):
+                return False
+
             strong_contexts = (
                 f"《{title_compact}》",
                 f"{title_compact}(",
@@ -6751,14 +9050,51 @@ function startPolling() {
                 f"🗄{title_compact}",
                 f"剧集🗄{title_compact}",
             )
+            if any(token in compact for token in strong_contexts):
+                return True
+
+            # 短标题必须是独立词边界，避免「九门」命中「老九门」。
+            boundary = rf"(?<![\u4e00-\u9fff]){re.escape(title_compact)}(?![\u4e00-\u9fff])"
+            if re.search(boundary, compact):
+                return True
+
             episode_context = re.search(
-                rf"{re.escape(title_compact)}(?:[sS]\d{{1,2}}[eE]?\d{{0,3}}|[eE]\d{{1,3}}|"
+                rf"(?<![\u4e00-\u9fff]){re.escape(title_compact)}"
+                rf"(?:[sS]\d{{1,2}}[eE]?\d{{0,3}}|[eE]\d{{1,3}}|"
                 rf"第?\d{{1,3}}[集话話]|(?:更新至|更新到|更新|更至|更)\d{{1,3}}[集话話]|"
+                rf"(?:更新至|更新到|更至|更)\d{{1,3}}(?!\d)|"
                 rf"全\d{{1,3}}[集话話]|全集|完结|已完结)",
                 compact,
             )
-            if not any(token in compact for token in strong_contexts) and not episode_context:
-                return True
+            return bool(episode_context)
+
+        return True
+
+    @classmethod
+    def _result_definitely_off_topic(cls, result: dict, subscription: dict) -> bool:
+        """过滤标题党、在线观影页、课程等明显不是目标剧资源的搜索结果。"""
+        title = str(subscription.get("title") or "").strip()
+        if not title:
+            return False
+
+        text = " ".join(
+            str(result.get(key, "") or "")
+            for key in ("note", "name", "title", "url")
+        )
+        compact = re.sub(r"\s+", "", text)
+        title_match_state = cls._subscription_title_match_state(compact, subscription)
+        if title_match_state is None or title_match_state is False:
+            return True
+
+        # 这些通常是在线播放/课程营销页，不是可转存的网盘剧集文件。
+        noise_tokens = (
+            "在线观看", "免费在线观看", "无广告在线", "超清免费在线观看",
+            "vs影视", "口语", "英语", "课程", "亲授", "老师", "电台",
+            "社交", "旅行", "达人", "教学理念",
+        )
+        compact_lower = compact.lower()
+        if any(token in compact_lower for token in noise_tokens):
+            return True
 
         return False
 
@@ -6869,15 +9205,31 @@ function startPolling() {
             except (TypeError, ValueError):
                 continue
 
-        # 全42集 / 共42集 / 完结42集：可信表达为 1..42。
-        for ep_s in re.findall(r'(?:全|共|完结)\s*0?(\d{1,3})\s*[集话話]', raw):
+        # 更08 / 更至08：部分网盘标题会省略“集”，仍表示更新到 1..08。
+        for ep_s in re.findall(r'(?:更新至|更新到|更至|更)\s*0?(\d{1,3})(?!\d)(?!\s*[pPkKgG])', raw):
             try:
                 cls._add_episode_span(episodes, 1, int(ep_s), max_episode=max_episode)
             except (TypeError, ValueError):
                 continue
 
-        # 全集/完结/Complete 但没有数字时，只有 TMDB 总集数已知才用于判断。
         lower = raw.lower()
+
+        # 全42集 / 完结42集：可信表达为 1..42。
+        for ep_s in re.findall(r'(?:全|完结)\s*0?(\d{1,3})\s*[集话話]', raw):
+            try:
+                cls._add_episode_span(episodes, 1, int(ep_s), max_episode=max_episode)
+            except (TypeError, ValueError):
+                continue
+        # “共30集”常见于总集数说明，不能当作当前资源已包含全集。
+        # 只有明确完结语境下才把它当成全集提示。
+        if any(token in raw for token in ("全集", "全季", "完结", "已完结")) or "complete" in lower:
+            for ep_s in re.findall(r'共\s*0?(\d{1,3})\s*[集话話]', raw):
+                try:
+                    cls._add_episode_span(episodes, 1, int(ep_s), max_episode=max_episode)
+                except (TypeError, ValueError):
+                    continue
+
+        # 全集/完结/Complete 但没有数字时，只有 TMDB 总集数已知才用于判断。
         if total_episodes and (
                 "全集" in raw or "全季" in raw or "完结" in raw
                 or "complete" in lower or "season complete" in lower):
@@ -6908,7 +9260,7 @@ function startPolling() {
                 seasons.update(range(a, b + 1))
 
         patterns = [
-            r'[Ss](\d{1,2})(?=[Ee\W_]|$)',
+            r'(?<![A-Za-z0-9])[Ss](\d{1,2})(?=[Ee\W_]|$)',
             r'season\s*(\d{1,2})',
             r'第\s*(\d{1,2})\s*季',
             r'(?<!\d)(\d{1,2})\s*季',
@@ -6925,8 +9277,61 @@ function startPolling() {
 
         return sorted(season for season in seasons if season is not None)
 
+    @staticmethod
+    def _split_path_segments(text: str) -> List[str]:
+        """把云盘路径拆成可单独判断的片段，避免父级目标剧名掩盖内层串剧目录。"""
+        return [
+            segment.strip()
+            for segment in re.split(r"[\\/]+", str(text or ""))
+            if segment and segment.strip()
+        ]
+
+    @staticmethod
+    def _subscription_expected_year(subscription: dict, expected_year: Optional[int] = None) -> Optional[int]:
+        if expected_year:
+            try:
+                return int(expected_year)
+            except (TypeError, ValueError):
+                return None
+        try:
+            year = subscription.get("year")
+            return int(year) if year not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    def _fallback_item_reject_reason(
+        self,
+        item: dict,
+        subscription: dict,
+        expected_year: Optional[int] = None,
+    ) -> str:
+        """返回降级复制前的负向证据；空字符串表示暂未发现明显串剧/错年。"""
+        expected = self._subscription_expected_year(subscription, expected_year)
+        segments = []
+        name_text = str(item.get("name", "") or "")
+        path_text = str(item.get("path", "") or "")
+        if name_text:
+            segments.append(("name", name_text))
+        for segment in self._split_path_segments(path_text):
+            segments.append(("path", segment))
+
+        for label, segment in segments:
+            title_state = self._subscription_title_match_state(segment, subscription)
+            if title_state is False:
+                return f"疑似串剧片段({label}): {segment[:80]}"
+
+            if expected:
+                segment_year = self._extract_year(segment)
+                if segment_year and segment_year != expected:
+                    # 降级转存的源路径里出现其它年份，通常代表内层实际资源不是目标剧。
+                    # 如“九门 更08 [2026]”分享内含“老9️⃣门（2016）”。
+                    if title_state is not None or re.search(r"[\u4e00-\u9fff]|[A-Za-z]{3,}", segment):
+                        return f"疑似错年片段({label}): {segment[:80]}，expected={expected}"
+
+        return ""
+
     def _fallback_result_matches_subscription(self, result: dict, subscription: dict) -> bool:
-        """降级转存前校验搜索结果季数，避免把 S01/S02 当成目标季。"""
+        """降级转存前校验搜索结果标题和季数，避免把相近短标题/错季资源当成目标。"""
         media_type = subscription.get("media_type", "电视剧")
         if media_type == "电影":
             return True
@@ -6935,10 +9340,45 @@ function startPolling() {
             str(result.get(key, "") or "")
             for key in ("note", "name", "title", "url")
         )
+        year_text = " ".join(
+            str(result.get(key, "") or "")
+            for key in ("note", "name", "title")
+        )
+        title_match_state = self._subscription_title_match_state(text, subscription)
+        if title_match_state is False or title_match_state is None:
+            logger.info(
+                f"【115助手】[降级] 跳过疑似非目标剧资源: "
+                f"title={subscription.get('title', '')}, note={str(result.get('note', ''))[:80]}"
+            )
+            return False
         seasons = self._extract_season_markers(text)
         if not seasons:
+            expected_year = self._subscription_expected_year(subscription)
+            if expected_year:
+                years = {
+                    int(match.group(0))
+                    for match in re.finditer(r'\b(?:19|20)\d{2}\b', year_text)
+                }
+                if years and expected_year not in years:
+                    logger.info(
+                        f"【115助手】[降级] 跳过非目标年份资源: target={expected_year}, "
+                        f"years={sorted(years)}, note={str(result.get('note', ''))[:80]}"
+                    )
+                    return False
             return True
         if target_season in seasons:
+            expected_year = self._subscription_expected_year(subscription)
+            if expected_year:
+                years = {
+                    int(match.group(0))
+                    for match in re.finditer(r'\b(?:19|20)\d{2}\b', year_text)
+                }
+                if years and expected_year not in years:
+                    logger.info(
+                        f"【115助手】[降级] 跳过非目标年份资源: target={expected_year}, "
+                        f"years={sorted(years)}, note={str(result.get('note', ''))[:80]}"
+                    )
+                    return False
             return True
         logger.info(
             f"【115助手】[降级] 跳过非目标季资源: target=S{target_season:02d}, "
@@ -6946,16 +9386,47 @@ function startPolling() {
         )
         return False
 
-    def _fallback_item_matches_subscription(self, item: dict, subscription: dict) -> bool:
-        """复制前按文件/目录路径再次校验季数。"""
+    def _fallback_item_matches_subscription(
+        self,
+        item: dict,
+        subscription: dict,
+        expected_year: Optional[int] = None,
+    ) -> bool:
+        """复制前按文件/目录路径再次校验标题和季数。"""
         media_type = subscription.get("media_type", "电视剧")
         if media_type == "电影":
             return True
         target_season = int(subscription.get("season") or 1)
-        text = " ".join(
-            str(item.get(key, "") or "")
-            for key in ("path", "name")
-        )
+        name_text = str(item.get("name", "") or "")
+        path_text = str(item.get("path", "") or "")
+
+        reject_reason = self._fallback_item_reject_reason(item, subscription, expected_year)
+        if reject_reason:
+            logger.info(
+                f"【115助手】[降级] 跳过疑似非目标文件: "
+                f"title={subscription.get('title', '')}, {reject_reason}, "
+                f"path={str(item.get('path', item.get('name', '')))[:120]}"
+            )
+            return False
+
+        # 先看文件/目录自身名称。路径里经常包含插件创建的目标暂存目录
+        # （如 /MP临时转存/九门），不能让它覆盖「老九门」这种文件名反证。
+        name_match_state = self._subscription_title_match_state(name_text, subscription)
+        if name_match_state is False:
+            logger.info(
+                f"【115助手】[降级] 跳过疑似串剧文件: "
+                f"title={subscription.get('title', '')}, path={str(item.get('path', item.get('name', '')))[:120]}"
+            )
+            return False
+        path_match_state = self._subscription_title_match_state(path_text, subscription)
+        if name_match_state is None and path_match_state is False:
+            logger.info(
+                f"【115助手】[降级] 跳过疑似串剧路径: "
+                f"title={subscription.get('title', '')}, path={str(item.get('path', item.get('name', '')))[:120]}"
+            )
+            return False
+
+        text = " ".join([path_text, name_text])
         seasons = self._extract_season_markers(text)
         if not seasons:
             return True
@@ -7013,6 +9484,7 @@ function startPolling() {
         tmdb_id: Optional[int],
         media_type_str: str,
         season: Optional[int],
+        total_episodes: Optional[int] = None,
     ) -> List[int]:
         """
         从 MP 的 mediaserveritem 索引读取 Plex/Emby 已入库状态。
@@ -7052,8 +9524,12 @@ function startPolling() {
             logger.info(f"【115助手】电影 TMDB={tmdb_id} 已在 Plex/Emby 媒体索引中")
             return [-1]
 
-        episodes = set()
+        server_episode_sets: Dict[str, set] = {}
+        skipped_stale_rows = False
         for row in rows:
+            server = str(row["server"] if isinstance(row, sqlite3.Row) else "" or "").strip().lower()
+            if not server:
+                server = "unknown"
             seasoninfo = row["seasoninfo"] if isinstance(row, sqlite3.Row) else None
             if not seasoninfo:
                 continue
@@ -7064,15 +9540,57 @@ function startPolling() {
                 continue
             if not isinstance(seasoninfo, dict):
                 continue
+            row_episodes = set()
             for ep in seasoninfo.get(target_season, []) or []:
                 try:
                     ep_num = int(ep)
                 except (TypeError, ValueError):
                     continue
                 if ep_num > 0:
-                    episodes.add(ep_num)
+                    row_episodes.add(ep_num)
+            if (
+                total_episodes
+                and row_episodes
+                and max(row_episodes) > int(total_episodes)
+            ):
+                logger.warning(
+                    f"【115助手】TMDB={tmdb_id} S{int(season or 1):02d} "
+                    f"{server} 媒体索引疑似旧缓存，最大集数 {max(row_episodes)} "
+                    f"超过 TMDB 总集数 {total_episodes}，本行跳过"
+                )
+                skipped_stale_rows = True
+                continue
+            if row_episodes:
+                server_episode_sets.setdefault(server, set()).update(row_episodes)
 
-        result = sorted(episodes)
+        if not server_episode_sets:
+            return []
+
+        if skipped_stale_rows and len(server_episode_sets) == 1:
+            logger.warning(
+                f"【115助手】TMDB={tmdb_id} S{int(season or 1):02d} "
+                "媒体索引已有旧缓存行，剩余单一媒体服务器结果不再单独采信"
+            )
+            return []
+
+        if len(server_episode_sets) == 1:
+            result = sorted(next(iter(server_episode_sets.values())))
+        else:
+            episode_votes: Dict[int, int] = {}
+            for episodes in server_episode_sets.values():
+                for ep in episodes:
+                    episode_votes[ep] = episode_votes.get(ep, 0) + 1
+            result = sorted(ep for ep, votes in episode_votes.items() if votes >= 2)
+            if not result:
+                result = sorted(min(server_episode_sets.values(), key=len))
+            union_result = sorted(set().union(*server_episode_sets.values()))
+            if result != union_result:
+                logger.warning(
+                    f"【115助手】TMDB={tmdb_id} S{int(season or 1):02d} "
+                    f"Plex/Emby 集数冲突，采用保守结果: "
+                    f"sources={{{', '.join(f'{k}:{sorted(v)}' for k, v in server_episode_sets.items())}}} "
+                    f"-> {result}"
+                )
         if result:
             logger.info(f"【115助手】TMDB={tmdb_id} S{int(season or 1):02d} 已在 Plex/Emby 索引中: {result}")
         return result
@@ -7121,10 +9639,118 @@ function startPolling() {
             if ep is not None
         })
 
+    @classmethod
+    def _resolve_115_local_mounts(cls, configured: str = "") -> List[Path]:
+        """
+        解析 115 在本容器内的挂载根目录。
+
+        优先用插件配置里显式填写的路径；未配置时按通用 CloudDrive 挂载约定探测，
+        避免把具体部署环境的路径写死在代码里。
+        """
+        explicit = str(configured or "").strip()
+        if explicit:
+            return [Path(p.strip()) for p in explicit.split(",") if p.strip()]
+        found = []
+        for pattern in cls._CD2_LOCAL_MOUNT_GLOBS:
+            try:
+                for hit in sorted(glob.glob(pattern)):
+                    p = Path(hit)
+                    if p.is_dir() and p not in found:
+                        found.append(p)
+            except Exception:
+                continue
+        return found
+
+    def _cd2_115_path_to_local_candidates(self, path: str) -> List[Path]:
+        """把 /115/... 形式的 CD2 路径映射到本容器内的 115 挂载路径。"""
+        normalized = str(path or "").strip().rstrip("/")
+        if not normalized:
+            return []
+        bases = self._resolve_115_local_mounts(self._cd2_local_mount_115)
+        for base in bases:
+            base_str = str(base).rstrip("/")
+            if normalized == base_str or normalized.startswith(base_str + "/"):
+                return [Path(normalized)]
+        if normalized == "/115":
+            rel = ""
+        elif normalized.startswith("/115/"):
+            rel = normalized[len("/115/"):]
+        else:
+            return []
+        return [(base / rel) if rel else base for base in bases]
+
+    def _get_direct_target_existing_episodes(
+        self,
+        title: str,
+        media_type_str: str,
+        season: Optional[int],
+    ) -> List[int]:
+        """只扫描当前剧所在的正式库目录，兜底修正 Plex/Emby 旧缓存。"""
+        if media_type_str == "电影":
+            return []
+
+        roots = []
+        for configured in (
+            self._closed_loop_ongoing_library_path,
+            self._closed_loop_archive_library_path,
+        ):
+            cd2_root = self._to_cd2_115_path(configured).rstrip("/")
+            roots.extend(self._cd2_115_path_to_local_candidates(cd2_root))
+
+        safe_title = self._safe_path_name(title)
+        subscription = {"title": title, "media_type": media_type_str, "season": season}
+        target_season = int(season or 1)
+        season_dir_names = {
+            f"Season {target_season}",
+            f"Season {target_season:02d}",
+            f"S{target_season:02d}",
+            f"第{target_season}季",
+        }
+        episodes = set()
+        for root in roots:
+            if not root.exists() or not root.is_dir():
+                continue
+            try:
+                children = list(root.iterdir())
+            except Exception as e:
+                logger.debug(f"【115助手】读取正式库目录失败 {root}: {e}")
+                continue
+            for show_dir in children:
+                if not show_dir.is_dir():
+                    continue
+                show_name = show_dir.name
+                if self._subscription_title_match_state(show_name, subscription) is not True:
+                    continue
+                if safe_title not in show_name and title not in show_name:
+                    continue
+                scan_dirs = [show_dir]
+                for child in show_dir.iterdir():
+                    if child.is_dir() and child.name in season_dir_names:
+                        scan_dirs.append(child)
+                for scan_dir in scan_dirs:
+                    try:
+                        file_iter = scan_dir.iterdir()
+                    except Exception:
+                        continue
+                    for item in file_iter:
+                        if not item.is_file():
+                            continue
+                        if item.suffix.lower() not in self._video_extensions:
+                            continue
+                        ep_num = self._parse_episode_number(item.name)
+                        if ep_num and ep_num > 0:
+                            episodes.add(int(ep_num))
+
+        result = sorted(episodes)
+        if result:
+            logger.info(f"【115助手】{title} 正式库单剧目录兜底集数: {result}")
+        return result
+
     def _get_existing_episodes(self, title: str, tmdb_id: Optional[int],
                                media_type_str: str, season: Optional[int],
                                force_refresh: bool = False,
-                               cached_episodes: Optional[List[int]] = None) -> List[int]:
+                               cached_episodes: Optional[List[int]] = None,
+                               total_episodes: Optional[int] = None) -> List[int]:
         """
         获取媒体库中已有的集数。
         电影：存在则返回 [-1]（哨兵值），不存在返回 []。
@@ -7142,14 +9768,52 @@ function startPolling() {
         try:
             cached_hint = self._normalize_existing_episode_hint(cached_episodes, media_type_str)
             history_episodes = self._get_transfer_history_episodes(tmdb_id, media_type_str, season)
+            closed_loop_episodes = self._get_closed_loop_organized_episodes(
+                tmdb_id,
+                media_type_str,
+                season,
+            )
             mediaserver_episodes = self._get_mediaserver_existing_episodes(
                 tmdb_id=tmdb_id,
                 media_type_str=media_type_str,
                 season=season,
+                total_episodes=total_episodes,
             )
+            episode_limit = 0
+            try:
+                episode_limit = int(total_episodes or 0)
+            except (TypeError, ValueError):
+                episode_limit = 0
+
+            def _drop_suspicious_over_total(label: str, episodes: List[int]) -> List[int]:
+                if media_type_str == "电影" or not episode_limit or not episodes:
+                    return episodes
+                cleaned = []
+                for ep in episodes:
+                    try:
+                        cleaned.append(int(ep))
+                    except (TypeError, ValueError):
+                        continue
+                if cleaned and max(cleaned) > episode_limit:
+                    logger.warning(
+                        f"【115助手】{title} {label} 集数疑似污染，最大集数 {max(cleaned)} "
+                        f"超过 TMDB 总集数 {episode_limit}，本来源本轮不采信"
+                    )
+                    return []
+                return sorted(set(ep for ep in cleaned if ep > 0))
+
+            cached_hint = _drop_suspicious_over_total("缓存", cached_hint)
+            history_episodes = _drop_suspicious_over_total("整理历史", history_episodes)
+            closed_loop_episodes = _drop_suspicious_over_total("插件闭环历史", closed_loop_episodes)
+            mediaserver_episodes = _drop_suspicious_over_total("Plex/Emby索引", mediaserver_episodes)
 
             if media_type_str == "电影":
-                if -1 in cached_hint or -1 in history_episodes or -1 in mediaserver_episodes:
+                if (
+                    -1 in cached_hint
+                    or -1 in history_episodes
+                    or -1 in closed_loop_episodes
+                    or -1 in mediaserver_episodes
+                ):
                     result = [-1]
                     self._set_existing_episodes_cache(cache_key, result)
                     return result
@@ -7166,13 +9830,36 @@ function startPolling() {
                 self._set_existing_episodes_cache(cache_key, result)
                 return result
 
-            merged_episodes = sorted(set(cached_hint) | set(history_episodes) | set(mediaserver_episodes))
-            if history_episodes or mediaserver_episodes or cached_hint:
+            merged_episodes = sorted(
+                set(cached_hint)
+                | set(history_episodes)
+                | set(closed_loop_episodes)
+                | set(mediaserver_episodes)
+            )
+            if history_episodes or closed_loop_episodes or mediaserver_episodes or cached_hint:
                 logger.info(
-                    f"【115助手】{title} 合并缓存/整理历史/Plex-Emby 集数: "
-                    f"cache={cached_hint}, history={history_episodes}, media={mediaserver_episodes} -> {merged_episodes}"
+                    f"【115助手】{title} 合并缓存/整理历史/插件闭环/Plex-Emby 集数: "
+                    f"cache={cached_hint}, history={history_episodes}, "
+                    f"closed_loop={closed_loop_episodes}, media={mediaserver_episodes} -> {merged_episodes}"
                 )
             if not force_refresh:
+                if (
+                    media_type_str != "电影"
+                    and total_episodes
+                    and not merged_episodes
+                ):
+                    direct_episodes = self._get_direct_target_existing_episodes(
+                        title=title,
+                        media_type_str=media_type_str,
+                        season=season,
+                    )
+                    direct_episodes = _drop_suspicious_over_total("正式库单剧目录", direct_episodes)
+                    if direct_episodes:
+                        merged_episodes = sorted(set(merged_episodes) | set(direct_episodes))
+                        logger.info(
+                            f"【115助手】{title} 使用正式库单剧目录兜底修正已有集数: "
+                            f"{merged_episodes}"
+                        )
                 self._set_existing_episodes_cache(cache_key, merged_episodes)
                 return merged_episodes
 
@@ -7428,9 +10115,10 @@ function startPolling() {
             return
 
         title = subscription.get("title", clean_keyword)
+        effective_fallback_clouds = self._get_effective_fallback_clouds()
         logger.info(
             f"【115助手】[降级] 开始备用云盘搜索: {title}, "
-            f"备用云盘: {self._fallback_clouds}"
+            f"已启用: {self._fallback_clouds}, 执行顺序: {effective_fallback_clouds}"
         )
         if self._is_115_cooldown_active(f"{title} 的降级转存"):
             return
@@ -7457,7 +10145,10 @@ function startPolling() {
             )
             return
 
-        fallback_clouds = list(self._fallback_clouds or [])
+        fallback_clouds = list(effective_fallback_clouds or [])
+        if not fallback_clouds:
+            logger.warning("【115助手】[降级] 未启用有效备用云盘，跳过降级转存")
+            return
         target_status_cache = {}
         fallback_fail_reasons = []
 
@@ -7557,6 +10248,12 @@ function startPolling() {
                             f"note={str(result.get('note', share_url))[:80]}"
                         )
                         continue
+
+                if self._is_dead_share_link(share_url):
+                    logger.info(
+                        f"【115助手】[降级] 跳过已失效分享({cloud_name}): {str(share_url)[:70]}"
+                    )
+                    continue
 
                 logger.info(
                     f"【115助手】[降级] 尝试{cloud_name}转存: "
@@ -7663,7 +10360,7 @@ function startPolling() {
                                 # 不 break，继续执行新一轮转存
                             else:
                                 _sys.stdout.write(
-                                    f"【降级】{cloud_name}临时目录已有内容，先复用并按缺失集过滤: {cd2_staging}\n"
+                                    f"【降级】{cloud_name}临时目录已有内容，稍后按缺失集判断是否复用: {cd2_staging}\n"
                                 )
                                 _sys.stdout.flush()
                     except Exception:
@@ -7720,17 +10417,25 @@ function startPolling() {
                                 if _total and _total > 0:
                                     _expected_eps = set(range(1, int(_total) + 1))
                                     if _expected_eps.issubset(_effective_existing_set):
-                                        _sys.stdout.write(
-                                            f"【降级】{title} 库+目标目录已覆盖全集 "
-                                            f"({len(_effective_existing_set & _expected_eps)}/{_total})，标记完结\n"
-                                        )
-                                        _sys.stdout.flush()
-                                        subscription["auto_completed"] = True
-                                        subscription["completed_time"] = datetime.now().isoformat()
-                                        subscription["completed_reason"] = (
-                                            f"库+目标目录全集覆盖 ({len(_effective_existing_set & _expected_eps)}/{_total})"
-                                        )
-                                        return  # 全集完整，退出 fallback
+                                        if self._should_allow_auto_complete(subscription):
+                                            _sys.stdout.write(
+                                                f"【降级】{title} 库+目标目录已覆盖全集 "
+                                                f"({len(_effective_existing_set & _expected_eps)}/{_total})，标记完结\n"
+                                            )
+                                            _sys.stdout.flush()
+                                            subscription["auto_completed"] = True
+                                            subscription["completed_time"] = datetime.now().isoformat()
+                                            subscription["completed_reason"] = (
+                                                f"库+目标目录全集覆盖 ({len(_effective_existing_set & _expected_eps)}/{_total})"
+                                            )
+                                        else:
+                                            _sys.stdout.write(
+                                                f"【降级】{title} 库+目标目录已覆盖当前已知全集 "
+                                                f"({len(_effective_existing_set & _expected_eps)}/{_total})，"
+                                                "但剧集仍在播出，暂不归档\n"
+                                            )
+                                            _sys.stdout.flush()
+                                        return  # 当前已知集数完整，退出 fallback
                                 _sys.stdout.write(
                                     f"【降级】{title} 将只补库+目标目录都缺失的集数\n"
                                 )
@@ -7846,9 +10551,99 @@ function startPolling() {
                         """检查目录是否有实际文件内容（用于判断转存是否完成）"""
                         return _has_files_recursive(_folder_item["path"], _depth=2)
 
+                    def _ep_num_from_fallback_name(_name):
+                        """从备用云盘文件名提取集号，用于判断暂存残留是否还能复用。"""
+                        _name = str(_name or "")
+                        _m = re.search(r'[Ss]\d+\s*[\.\-_\s]?\s*[Ee](\d+)', _name)
+                        if _m:
+                            return int(_m.group(1))
+                        _m = re.search(r'第(\d+)[集话]', _name)
+                        if _m:
+                            return int(_m.group(1))
+                        _m = re.search(r'[Ee][Pp]?(\d{1,3})\b', _name)
+                        if _m:
+                            return int(_m.group(1))
+                        _m = re.match(r'^0?(\d{1,3})[xX](?:[\s\._\-~]|$)', _name)
+                        if _m:
+                            return int(_m.group(1))
+                        _m = re.match(r'^(\d{1,3})(?:[\s\._\-~]|$)', _name)
+                        if _m:
+                            return int(_m.group(1))
+                        return None
+
+                    def _collect_staging_files(_items, _depth=0):
+                        """展开暂存目录到文件层，供复用判断和后续复制共用。"""
+                        _files = []
+                        if not _items or _depth > 4:
+                            return _files
+                        for _item in _items:
+                            if not _item.get("is_dir"):
+                                _files.append(_item)
+                                continue
+                            _sub = _cd2_list_with_timeout(_item["path"], _force=True) or []
+                            _files.extend(_collect_staging_files(_sub, _depth + 1))
+                        return _files
+
                     # 1. 先检查暂存是否已有内容（上次转存未完成的遗留）
                     _existing = _cd2_list_with_timeout(cd2_staging, _force=False)
                     _skip_save_share = False
+                    _wanted_episode_set = set()
+                    if subscription.get("media_type", "电视剧") != "电影":
+                        try:
+                            _total_eps_for_staging = int(subscription.get("_cache_total_episodes") or 0)
+                        except (TypeError, ValueError):
+                            _total_eps_for_staging = 0
+                        if _total_eps_for_staging > 0:
+                            _wanted_episode_set = (
+                                set(range(1, _total_eps_for_staging + 1)) - set(_effective_existing_set)
+                            )
+                        _result_hints = self._extract_episode_hints_from_text(
+                            " ".join(
+                                str(result.get(key, "") or "")
+                                for key in ("note", "name", "title", "url")
+                            ),
+                            total_episodes=subscription.get("_cache_total_episodes"),
+                            target_season=subscription.get("season"),
+                        )
+                        if _result_hints:
+                            _hint_set = set(_result_hints)
+                            _wanted_episode_set = (
+                                (_wanted_episode_set & _hint_set)
+                                if _wanted_episode_set
+                                else (_hint_set - set(_effective_existing_set))
+                            )
+
+                    if _existing and subscription.get("media_type", "电视剧") != "电影" and _wanted_episode_set:
+                        _staging_files = _collect_staging_files(_existing)
+                        _staging_eps = {
+                            _ep for _ep in (
+                                _ep_num_from_fallback_name(_item.get("name", ""))
+                                for _item in _staging_files
+                            )
+                            if _ep is not None
+                        }
+                        if not (_staging_eps & _wanted_episode_set):
+                            _sys.stdout.write(
+                                f"【降级】暂存目录不含本轮缺失集 "
+                                f"{sorted(_wanted_episode_set)}，清理后重新转存: {cd2_staging}\n"
+                            )
+                            _sys.stdout.flush()
+                            try:
+                                self._cleanup_fallback_staging(
+                                    cd2,
+                                    _existing,
+                                    cloud_client,
+                                    cloud_api_staging,
+                                )
+                            except Exception as _ce:
+                                _sys.stdout.write(f"【降级】清理暂存异常: {_ce}\n"); _sys.stdout.flush()
+                            _existing = []
+                        else:
+                            _sys.stdout.write(
+                                f"【降级】暂存目录包含本轮缺失集 {sorted(_staging_eps & _wanted_episode_set)}，复用暂存\n"
+                            )
+                            _sys.stdout.flush()
+
                     if _existing and all(item.get("is_dir") for item in _existing):
                         # 顶层是文件夹，检查内层是否有文件
                         if any(_has_inner_content(f) for f in _existing):
@@ -7903,6 +10698,11 @@ function startPolling() {
 
                         if not _finished or not _result_box[0]:
                             reason = "超时" if not _finished else "失败"
+                            # 分享本身已被取消/失效时拉黑，避免每轮重复请求同一死链
+                            if _finished and getattr(cloud_client, "last_share_dead", False):
+                                self._mark_dead_share_link(share_url, cloud_name)
+                                _remember_fallback_reason(f"{cloud_name}: 分享已失效")
+                                continue
                             logger.warning(
                                 f"【115助手】[降级] {cloud_name}转存{reason}: {share_url[:60]}"
                             )
@@ -7916,13 +10716,17 @@ function startPolling() {
 
                     _poll_start = time.time()
                     top_items = []
+                    _staging_not_found_count = 0
+                    _staging_missing_reason = ""
                     while time.time() - _poll_start < _FILE_WAIT_MAX:
                         _t2 = _cd2_list_with_timeout(cd2_staging, _force=True)
                         if _t2 is None:
                             # gRPC 超时，稍后重试
                             time.sleep(_FILE_WAIT_STEP)
                             continue
+                        _list_err = getattr(cd2, "last_error", "") or ""
                         if _t2:
+                            _staging_not_found_count = 0
                             if all(item.get("is_dir") for item in _t2):
                                 # 顶层全是文件夹：检查内层是否有文件
                                 if any(_has_inner_content(f) for f in _t2):
@@ -7932,6 +10736,18 @@ function startPolling() {
                                 # 顶层直接有文件
                                 top_items = _t2
                                 break
+                        elif _list_err and "not_found" in _list_err.lower():
+                            _staging_not_found_count += 1
+                            _elapsed = int(time.time() - _poll_start)
+                            if _staging_not_found_count >= 3 and _elapsed >= 40:
+                                _staging_missing_reason = (
+                                    f"暂存目录保存后仍不可见: {cd2_staging} | {_list_err}"
+                                )
+                                _sys.stdout.write(f"【降级】{_staging_missing_reason}\n")
+                                _sys.stdout.flush()
+                                break
+                        else:
+                            _staging_not_found_count = 0
                         # 文件未就绪，等待后重试
                         _elapsed = int(time.time() - _poll_start)
                         _sys.stdout.write(
@@ -7942,6 +10758,10 @@ function startPolling() {
 
                     if not top_items:
                         # 超时：不清理暂存，留待下次检查时使用
+                        if _staging_missing_reason:
+                            logger.warning(f"【115助手】[降级] {cloud_name}{_staging_missing_reason}")
+                            _remember_fallback_reason(f"{cloud_name}: 暂存目录不可见")
+                            continue
                         logger.warning(
                             f"【115助手】[降级] {cloud_name}文件等待超时 ({_FILE_WAIT_MAX}s): {cd2_staging}"
                         )
@@ -7970,7 +10790,7 @@ function startPolling() {
 
                     season_filtered_items = [
                         _item for _item in copy_items
-                        if self._fallback_item_matches_subscription(_item, subscription)
+                        if self._fallback_item_matches_subscription(_item, subscription, expected_year)
                     ]
                     if len(season_filtered_items) < len(copy_items):
                         _sys.stdout.write(
@@ -7991,20 +10811,7 @@ function startPolling() {
                     # 从文件名提取集号（无条件定义，避免后续作用域问题）
                     def _ep_num_from_name(_name):
                         """支持多种命名格式：S01E08 / S01.E08 / 第08集 / EP08 / 纯数字开头。"""
-                        m = _re_ep.search(r'[Ss]\d+\s*[\.\-_\s]?\s*[Ee](\d+)', _name)
-                        if m:
-                            return int(m.group(1))
-                        m = _re_ep.search(r'第(\d+)[集话]', _name)
-                        if m:
-                            return int(m.group(1))
-                        m = _re_ep.search(r'[Ee][Pp]?(\d{1,3})\b', _name)
-                        if m:
-                            return int(m.group(1))
-                        # 纯数字开头（如 "13 4K.mp4" → 13）
-                        m = _re_ep.match(r'^(\d{1,3})(?:[\s\._\-~]|$)', _name)
-                        if m:
-                            return int(m.group(1))
-                        return None
+                        return _ep_num_from_fallback_name(_name)
 
                     def _collect_fallback_files(_items, _depth=0):
                         """把降级暂存目录展开到文件层，避免复制 titleless 的目录结构进 115。"""
@@ -8037,6 +10844,82 @@ function startPolling() {
                         _sys.stdout.flush()
                         _remember_fallback_reason(f"{cloud_name}: 展开后无可复制文件")
                         continue
+
+                    post_flatten_matched_items = [
+                        _item for _item in copy_items
+                        if self._fallback_item_matches_subscription(_item, subscription, expected_year)
+                    ]
+                    if len(post_flatten_matched_items) < len(copy_items):
+                        _sys.stdout.write(
+                            f"【降级】展开后按标题/季过滤: {len(copy_items)} → {len(post_flatten_matched_items)}\n"
+                        )
+                        _sys.stdout.flush()
+                    copy_items = post_flatten_matched_items
+                    if not copy_items:
+                        _sys.stdout.write("【降级】展开后没有匹配目标剧的文件，跳过该资源\n")
+                        _sys.stdout.flush()
+                        _remember_fallback_reason(f"{cloud_name}: 展开后无匹配目标剧文件")
+                        continue
+
+                    _media_type = subscription.get("media_type", "电视剧")
+                    _archive_exts = getattr(self, "_ARCHIVE_EXTENSIONS", set())
+                    _payload_items = []
+                    for _item in copy_items:
+                        if _item.get("is_dir"):
+                            _payload_items.append(_item)
+                            continue
+                        _name = _item.get("name", "")
+                        _ext = _osp.splitext(_name or "")[1].lower()
+                        if _ext in _archive_exts:
+                            _sys.stdout.write(f"【降级】跳过压缩包/镜像文件: {_name}\n")
+                            _sys.stdout.flush()
+                            continue
+                        if (
+                            _media_type == "电影"
+                            and _ext not in self._video_extensions
+                            and _ext not in self._COMPANION_EXTENSIONS
+                        ):
+                            _sys.stdout.write(f"【降级】跳过电影非媒体文件: {_name}\n")
+                            _sys.stdout.flush()
+                            continue
+                        _payload_items.append(_item)
+                    copy_items = _payload_items
+                    if not copy_items:
+                        _sys.stdout.write("【降级】过滤后没有可复制媒体文件，跳过该资源\n")
+                        _sys.stdout.flush()
+                        _remember_fallback_reason(f"{cloud_name}: 无可复制媒体文件")
+                        continue
+
+                    try:
+                        _total_episode_limit = int(subscription.get("_cache_total_episodes") or 0)
+                    except (TypeError, ValueError):
+                        _total_episode_limit = 0
+                    if _media_type != "电影" and _total_episode_limit > 0:
+                        _bounded_items = []
+                        for _item in copy_items:
+                            if _item.get("is_dir"):
+                                _bounded_items.append(_item)
+                                continue
+                            _ep = _ep_num_from_name(_item.get("name", ""))
+                            if _ep is not None and _ep > _total_episode_limit:
+                                _sys.stdout.write(
+                                    f"【降级】跳过超过总集数的文件 E{_ep:02d}/{_total_episode_limit}: "
+                                    f"{_item.get('path') or _item.get('name', '')}\n"
+                                )
+                                _sys.stdout.flush()
+                                continue
+                            _bounded_items.append(_item)
+                        if len(_bounded_items) < len(copy_items):
+                            _sys.stdout.write(
+                                f"【降级】按总集数上限过滤: {len(copy_items)} → {len(_bounded_items)}\n"
+                            )
+                            _sys.stdout.flush()
+                        copy_items = _bounded_items
+                        if not copy_items:
+                            _sys.stdout.write("【降级】所有文件均超过总集数上限，跳过该资源\n")
+                            _sys.stdout.flush()
+                            _remember_fallback_reason(f"{cloud_name}: 文件超过总集数上限")
+                            continue
 
                     # 4b. 按缺失集数过滤：库里已有 + 115目标目录已有 + pending 都不再复制
                     _existing_set = set(_effective_existing_set)
@@ -8094,7 +10977,6 @@ function startPolling() {
 
                     # 4c. 统一规范化剧集文件名，确保 MP 看到的是「剧名.SxxEyy」。
                     _season_num = subscription.get("season") or 1
-                    _media_type = subscription.get("media_type", "电视剧")
                     _video_exts = {
                         ".mp4", ".mkv", ".ts", ".m2ts", ".avi", ".mov", ".wmv",
                         ".flv", ".webm", ".rmvb", ".mpg", ".mpeg", ".m4v",
@@ -8116,6 +10998,7 @@ function startPolling() {
                             r'^[Ss]\d+\s*[\.\-_\s]?\s*[Ee]\d+\s*[\s\._\-~]*',
                             r'^[Ee][Pp]?\d{1,3}\b\s*[\s\._\-]*',
                             r'^第\d+[集话]\s*[\s\._\-]*',
+                            r'^\d{1,3}[xX]\s*[\s\._\-~]*',
                             r'^\d{1,3}(?:[\s\._\-~]+|$)\s*',
                         ]
                         for _pat in _patterns:
@@ -8312,12 +11195,12 @@ function startPolling() {
                                     _subs = self._load_subscriptions()
                                     _tmdb = _sub.get("tmdb_id")
                                     _seas = _sub.get("season")
+                                    _pending_eps = _sub.get("pending_copy_episodes", [])
                                     for _s in _subs:
                                         if _s.get("tmdb_id") == _tmdb and _s.get("season") == _seas:
                                             _s["last_found"] = _sub["last_found"]
                                             _s["last_found_via"] = _via_copied
                                             _s["pending_copy_status"] = "copied_to_staging"
-                                            _pending_eps = _sub.get("pending_copy_episodes", [])
                                             if _pending_eps:
                                                 _s["pending_copy_episodes"] = _pending_eps
                                                 _s["pending_copy_since"] = _sub.get("pending_copy_since") or datetime.now().isoformat()
@@ -8330,6 +11213,12 @@ function startPolling() {
                                                 _s["completed_reason"] = "降级转存成功"
                                             break
                                     self._save_subscriptions(_subs)
+                                if _pending_eps and not _movie:
+                                    self._start_pending_organize_background(
+                                        tmdb_id=int(_tmdb) if _tmdb else None,
+                                        season=int(_seas) if _seas else None,
+                                        reason=f"CD2降级复制完成后自动整理待入库: {_title}",
+                                    )
                                 if _notify:
                                     _season_str = f" 第{_season}季" if _season else ""
                                     self.post_message(
@@ -8962,7 +11851,8 @@ function startPolling() {
     def _find_missing_episodes(self, parsed_files: List[dict],
                                target_season: Optional[int],
                                existing_episodes: List[int],
-                               media_type_str: str = "电视剧") -> List[dict]:
+                               media_type_str: str = "电视剧",
+                               total_episodes: Optional[int] = None) -> List[dict]:
         """
         筛选出缺失的集数对应的文件。
 
@@ -8974,6 +11864,10 @@ function startPolling() {
         is_movie = (media_type_str == "电影")
         missing = []
         existing_set = set(existing_episodes)
+        try:
+            episode_limit = int(total_episodes or 0)
+        except (TypeError, ValueError):
+            episode_limit = 0
 
         for f in parsed_files:
             file_season = f.get("season")
@@ -8983,6 +11877,21 @@ function startPolling() {
                 continue
 
             if file_episodes:
+                over_limit = False
+                if episode_limit:
+                    for ep in file_episodes:
+                        try:
+                            if int(ep) > episode_limit:
+                                over_limit = True
+                                break
+                        except (TypeError, ValueError):
+                            continue
+                if over_limit:
+                    logger.info(
+                        f"【115助手】跳过超过总集数上限的文件: "
+                        f"name={f.get('name', '')}, episodes={file_episodes}, total={episode_limit}"
+                    )
+                    continue
                 # 电视剧：只保留缺失集
                 if any(ep not in existing_set for ep in file_episodes):
                     missing.append(f)
@@ -9099,23 +12008,109 @@ function startPolling() {
         self._subscriptions = subscriptions
         self.save_data("subscriptions", subscriptions)
 
+    @staticmethod
+    def _subscription_identity_matches(current: dict, processed: dict) -> bool:
+        """同一订阅键下，如 created 不同，说明运行期间被删后重加，不能用旧状态覆盖。"""
+        current_created = current.get("created")
+        processed_created = processed.get("created")
+        return not current_created or not processed_created or current_created == processed_created
+
+    def _merge_processed_subscriptions(
+        self,
+        latest_subscriptions: List[dict],
+        processed_subscriptions: List[dict],
+        completed_keys: Optional[set] = None,
+        context: str = "订阅任务",
+    ) -> List[dict]:
+        """
+        长任务结束时合并订阅状态，避免用任务开始时的旧列表覆盖运行期间新增的订阅。
+        调用方需持有 _subscriptions_lock。
+        """
+        completed_keys = completed_keys or set()
+        processed_by_key = {}
+        for sub in processed_subscriptions or []:
+            key = self._subscription_key(sub)
+            if key[0] is not None:
+                processed_by_key[key] = sub
+
+        merged = []
+        preserved_new = []
+        skipped_removed_or_readded = []
+        updated_count = 0
+
+        for current in latest_subscriptions or []:
+            key = self._subscription_key(current)
+            if key[0] is not None and key in completed_keys:
+                continue
+            processed = processed_by_key.get(key)
+            if processed and self._subscription_identity_matches(current, processed):
+                merged.append(processed)
+                updated_count += 1
+            else:
+                merged.append(current)
+                if key[0] is not None and key not in processed_by_key:
+                    preserved_new.append(current.get("title") or str(key[0]))
+                elif processed:
+                    skipped_removed_or_readded.append(current.get("title") or str(key[0]))
+
+        latest_keys = {
+            self._subscription_key(s)
+            for s in latest_subscriptions or []
+            if self._subscription_key(s)[0] is not None
+        }
+        for key, sub in processed_by_key.items():
+            if key not in latest_keys and key not in completed_keys:
+                skipped_removed_or_readded.append(sub.get("title") or str(key[0]))
+
+        if preserved_new:
+            logger.info(
+                f"【115助手】{context}保存时保留运行期间新增订阅: "
+                f"{', '.join(preserved_new)}"
+            )
+        if skipped_removed_or_readded:
+            logger.info(
+                f"【115助手】{context}保存时检测到已删除或重建订阅，不用旧状态覆盖: "
+                f"{', '.join(skipped_removed_or_readded)}"
+            )
+        logger.info(
+            f"【115助手】{context}合并保存订阅: 最新={len(latest_subscriptions or [])}, "
+            f"处理更新={updated_count}, 保存={len(merged)}"
+        )
+        return merged
+
     def add_subscription(self, sub: dict) -> bool:
         """添加订阅（加锁，防止与 check_subscriptions 并发覆盖）"""
         with self._subscriptions_lock:
             key = self._subscription_key(sub)
             if key[0] is not None and key in self._archived_subscription_keys():
+                # 归档不再阻断重新订阅：实际目录可能已删除，需要重新追更。
+                # 自动解除归档（删除历史记录）后继续走正常添加流程。
+                history = self._load_history()
+                new_history = [
+                    item for item in history
+                    if self._subscription_key(item) != key
+                ]
+                if len(new_history) != len(history):
+                    self._save_history(new_history)
                 logger.info(
-                    f"【115助手】订阅已在历史归档中，拒绝重新添加: "
+                    f"【115助手】订阅命中历史归档，自动解除归档并重新添加: "
                     f"TMDB={key[0]}, 季={key[1]}, 标题={sub.get('title', '')}"
                 )
-                return False
             subs = self._load_subscriptions()
             for s in subs:
                 if s.get("tmdb_id") == sub.get("tmdb_id") and s.get("season") == sub.get("season"):
+                    logger.info(
+                        f"【115助手】订阅已存在，跳过新增: "
+                        f"TMDB={sub.get('tmdb_id')}, 季={sub.get('season')}, 标题={sub.get('title', '')}"
+                    )
                     return False
             sub["created"] = datetime.now().isoformat()
             subs.append(sub)
             self._save_subscriptions(subs)
+            logger.info(
+                f"【115助手】新增订阅已保存: TMDB={sub.get('tmdb_id')}, "
+                f"季={sub.get('season')}, 标题={sub.get('title', '')}, active={len(subs)}"
+            )
             return True
 
     def remove_subscription(self, tmdb_id: int, season: Optional[int] = None) -> bool:
@@ -9187,6 +12182,25 @@ function startPolling() {
     def list_history(self) -> List[dict]:
         """列出历史订阅"""
         return self._load_history()
+
+    def delete_history(self, tmdb_id: int, season: Optional[int] = None) -> int:
+        """删除历史归档记录（加锁）。season 为 None 时删除该 TMDB 下所有季。返回删除条数。"""
+        with self._subscriptions_lock:
+            history = self._load_history()
+            remaining = []
+            removed = 0
+            for item in history:
+                if (item.get("tmdb_id") == tmdb_id
+                        and (season is None or item.get("season") == season)):
+                    removed += 1
+                    continue
+                remaining.append(item)
+            if removed:
+                self._save_history(remaining)
+                logger.info(
+                    f"【115助手】删除历史归档: TMDB={tmdb_id}, 季={season}, 数量={removed}"
+                )
+            return removed
 
     # ================================================================
     #  通知辅助
@@ -9363,6 +12377,35 @@ function startPolling() {
             "year": record.get("year"),
         }
 
+    @staticmethod
+    def _cd2_watch_notice_stable_key(record: dict) -> str:
+        """同一剧集的 CD2 巡查通知使用稳定键，避免按复制时间重复排队。"""
+        tmdb_id = record.get("tmdb_id")
+        try:
+            tmdb_id = int(tmdb_id) if tmdb_id not in (None, "") else None
+        except (TypeError, ValueError):
+            tmdb_id = None
+        subject = (
+            f"tmdb:{tmdb_id}"
+            if tmdb_id
+            else str(record.get("show_key") or record.get("raw_name") or record.get("title") or "").strip()
+        )
+        media_type_str = str(record.get("media_type") or "电视剧")
+        category = str(record.get("category") or "").strip()
+        season = record.get("season")
+        target_path = str(record.get("target_path") or "")
+        target_parent = str(PurePosixPath(target_path).parent) if target_path else ""
+        episodes = sorted({int(ep) for ep in (record.get("episodes") or []) if ep is not None})
+        episodes_key = ",".join(str(ep) for ep in episodes) if episodes else "movie"
+        return "|".join([
+            subject,
+            media_type_str,
+            category,
+            str(season or 0),
+            episodes_key,
+            target_parent,
+        ])
+
     def _mark_cd2_watch_notice_confirmed(self, record: dict) -> None:
         rule_id = str(record.get("rule_id") or "")
         show_key = str(record.get("show_key") or "")
@@ -9436,38 +12479,132 @@ function startPolling() {
             return bool(existing_eps)
         return set(episodes).issubset(existing_eps)
 
-    def _send_cd2_watch_notice_record(self, record: dict) -> None:
-        subscription = self._build_cd2_watch_subscription(record)
-        media_type_str = subscription.get("media_type", "电视剧")
-        episodes = sorted({int(ep) for ep in (record.get("episodes") or []) if ep is not None})
+    def _is_cd2_watch_notice_copy_confirmed(
+        self,
+        record: dict,
+        min_age_seconds: int = 90,
+        min_attempts: int = 2,
+    ) -> bool:
+        """
+        CD2 复制完成后媒体服务器可能已扫到文件，但 MP 的 mediaserveritem
+        索引不会立刻同步。避免通知长期卡住，几轮媒体库确认失败后以复制完成兜底。
+        """
+        copy_completed_at = self._parse_iso_datetime(record.get("copy_completed_at"))
+        if not copy_completed_at:
+            return False
+        try:
+            attempts = int(record.get("confirm_attempts") or 0)
+        except (TypeError, ValueError):
+            attempts = 0
+        age = (datetime.now() - copy_completed_at).total_seconds()
+        if attempts < min_attempts and age < min_age_seconds:
+            return False
+        title = record.get("title") or record.get("raw_name") or ""
+        logger.info(
+            f"【CD2巡查】{title} 媒体库索引暂未同步，"
+            f"已按复制完成兜底确认入库: attempts={attempts}, age={int(age)}s"
+        )
+        return True
 
-        if media_type_str != "电影":
-            notice_episodes, skipped_episodes = self._filter_plugin_notice_episodes(subscription, episodes)
-            if skipped_episodes:
-                logger.info(
-                    f"【CD2巡查】{subscription.get('title')} 已有 MP 整理历史，跳过插件补通知: "
-                    f"{self._format_episode_preview(skipped_episodes)}"
+    def _send_cd2_watch_notice_group(self, records: List[dict]) -> str:
+        """发送一部作品的聚合通知，返回 sent/skipped/deferred。"""
+        filtered_records = []
+        for record in records or []:
+            subscription = self._build_cd2_watch_subscription(record)
+            media_type_str = subscription.get("media_type", "电视剧")
+            episodes = sorted({
+                int(ep) for ep in (record.get("episodes") or []) if ep is not None
+            })
+            if media_type_str != "电影":
+                notice_episodes, skipped_episodes = self._filter_plugin_notice_episodes(
+                    subscription, episodes
                 )
-            if episodes and not notice_episodes:
-                return
-            episodes = notice_episodes
+                if skipped_episodes:
+                    logger.info(
+                        f"【CD2巡查】{subscription.get('title')} "
+                        "已有整理历史或插件通知账本，跳过插件补通知: "
+                        f"{self._format_episode_preview(skipped_episodes)}"
+                    )
+                if episodes and not notice_episodes:
+                    continue
+                episodes = notice_episodes
+            filtered = dict(record)
+            filtered["episodes"] = episodes
+            filtered_records.append(filtered)
 
-        if media_type_str != "电影" and not episodes:
-            title = str(subscription.get("title") or record.get("raw_name") or "").strip()
+        if not filtered_records:
+            return "skipped"
+
+        subscription = self._build_cd2_watch_subscription(filtered_records[0])
+        allowed, rate_reason, retry_after = self._check_plugin_notice_rate_limit(subscription)
+        if not allowed:
+            reason_text = "同剧限频" if rate_reason == "same_title" else "全局限频"
+            logger.warning(
+                f"【CD2巡查】{subscription.get('title')} 入库通知触发{reason_text}，"
+                f"约 {retry_after}s 后重试；通知记录继续保留，不会丢失"
+            )
+            return "deferred"
+
+        media_type_str = subscription.get("media_type", "电视剧")
+        source_files = [
+            item
+            for record in filtered_records
+            for item in (record.get("source_files") or [])
+        ]
+        all_episodes = sorted({
+            int(ep)
+            for record in filtered_records
+            for ep in (record.get("episodes") or [])
+            if ep is not None
+        })
+        seasons = sorted({
+            int(record.get("season") or 1)
+            for record in filtered_records
+            if record.get("media_type") != "电影"
+        })
+        season_episode_override = (
+            self._format_multi_season_notice(filtered_records)
+            if len(seasons) > 1
+            else None
+        )
+
+        if media_type_str != "电影" and not all_episodes:
+            title = str(subscription.get("title") or filtered_records[0].get("raw_name") or "").strip()
             self.post_message(
                 NotificationType.Organize,
                 f"{title} 已入库",
                 "CD2巡查确认入库",
             )
-            return
+            sent = True
+        else:
+            sent = self._post_organize_success_template_message(
+                subscription=subscription,
+                episodes=all_episodes,
+                source_files=source_files,
+                reason="CD2巡查确认入库",
+                source_label="CD2巡查入库",
+                season_episode_override=season_episode_override,
+                mark_notice=False,
+            )
+        if not sent:
+            return "skipped"
 
-        self._post_organize_success_template_message(
-            subscription=subscription,
-            episodes=episodes,
-            source_files=record.get("source_files") or [],
-            reason="CD2巡查确认入库",
-            source_label="CD2巡查入库",
+        self._record_plugin_notice_rate_event(subscription)
+        for record in filtered_records:
+            self._mark_plugin_notice_sent(
+                self._build_cd2_watch_subscription(record),
+                record.get("episodes") or [],
+            )
+        logger.info(
+            f"【CD2巡查】{subscription.get('title')} 聚合发送 1 条入库通知: "
+            f"{season_episode_override or self._format_episode_preview(all_episodes)}，"
+            f"合并记录 {len(filtered_records)} 条"
         )
+        return "sent"
+
+    def _send_cd2_watch_notice_record(self, record: dict) -> bool:
+        """兼容单条调用；真实发送统一经过作品级聚合与限频。"""
+        return self._send_cd2_watch_notice_group([record]) != "deferred"
 
     def _confirm_cd2_watch_pending_notices(
         self,
@@ -9490,28 +12627,57 @@ function startPolling() {
                     return
 
                 remaining = []
-                confirmed = 0
+                ready_notices = []
+                confirmed_records = 0
+                sent_groups = 0
                 for notice in notices:
                     try:
-                        if self._is_cd2_watch_notice_confirmed(notice):
+                        if (
+                            self._is_cd2_watch_notice_confirmed(notice)
+                            or self._is_cd2_watch_notice_copy_confirmed(notice)
+                        ):
                             self._mark_cd2_watch_notice_confirmed(notice)
-                            self._send_cd2_watch_notice_record(notice)
-                            confirmed += 1
+                            ready_notices.append(notice)
                         else:
                             notice["confirm_attempts"] = int(notice.get("confirm_attempts") or 0) + 1
+                            notice.pop("notification_rate_deferred", None)
                             remaining.append(notice)
                     except Exception as e:
                         logger.warning(f"【CD2巡查】确认入库通知失败 {notice.get('title')}: {e}")
                         notice["confirm_attempts"] = int(notice.get("confirm_attempts") or 0) + 1
                         remaining.append(notice)
 
+                for group in self._group_cd2_watch_notice_records(ready_notices):
+                    try:
+                        result = self._send_cd2_watch_notice_group(group)
+                        if result == "deferred":
+                            for notice in group:
+                                notice["notification_rate_deferred"] = True
+                                remaining.append(notice)
+                            continue
+                        confirmed_records += len(group)
+                        if result == "sent":
+                            sent_groups += 1
+                    except Exception as e:
+                        title = group[0].get("title") if group else "未知作品"
+                        logger.warning(f"【CD2巡查】聚合发送入库通知失败 {title}: {e}")
+                        remaining.extend(group)
+
                 self._save_cd2_watch_pending_notices(remaining)
-                if confirmed:
-                    logger.info(f"【CD2巡查】本轮已确认并发送 {confirmed} 条入库通知")
+                if confirmed_records:
+                    logger.info(
+                        f"【CD2巡查】本轮确认 {confirmed_records} 条入库记录，"
+                        f"按作品聚合发送 {sent_groups} 条通知"
+                    )
                 if not remaining or round_index >= max(int(rounds or 1), 1) - 1:
                     return
 
-                self._refresh_cd2_watch_mediaservers(remaining)
+                refresh_remaining = [
+                    notice for notice in remaining
+                    if not notice.get("notification_rate_deferred")
+                ]
+                if refresh_remaining:
+                    self._refresh_cd2_watch_mediaservers(refresh_remaining)
                 time.sleep(sleep_seconds)
         finally:
             lock.release()
@@ -9539,15 +12705,26 @@ function startPolling() {
         ).start()
         return True
 
+    def _run_cd2_watch_notice_compensation(self) -> None:
+        if not self._load_cd2_watch_pending_notices():
+            return
+        self._start_cd2_watch_notice_background(
+            reason="CD2巡查入库通知补偿确认",
+            initial_delay=0,
+            rounds=1,
+            sleep_seconds=60,
+        )
+
     # ================================================================
     #  CD2 巡查同步
     # ================================================================
 
-    # 集号解析正则：兼容 S01E04 / 第04集 / EP04 / E04 / 纯数字
+    # 集号解析正则：兼容 S01E04 / 第04集 / EP04 / E04 / 01x
     _EP_PATTERN = re.compile(
         r'[Ss]\d{1,2}[Ee](\d{1,3})'           # S01E04 → group(1)
         r'|第\s*(\d{1,4})\s*[集话話]'            # 第04集  → group(2)
         r'|[Ee][Pp]?\.?(\d{1,3})(?!\d)'        # EP04/E04 → group(3)
+        r'|(?:^|[\\/._\-\s])0?(\d{1,3})[xX](?=[._\-\s]|$)'  # 01x.mkv → group(4)
     )
     _SEASON_PATTERN = re.compile(
         r'(?:^|[\\/._\-\s])(?:[Ss](?:eason)?\.?\s*0?(\d{1,2})(?!\d)|第\s*0?(\d{1,2})\s*季)',
@@ -9593,10 +12770,10 @@ function startPolling() {
 
     @staticmethod
     def _season_dir_name(season: int) -> str:
-        return f"Season {int(season):02d}"
+        return f"Season {int(season)}"
 
     def _find_or_create_season_dir(self, cd2, dest_show_path: str, season: int) -> str:
-        """在目标剧目录下查找季目录；不存在时创建 Season 01 这类目录。"""
+        """在目标剧目录下查找季目录；不存在时创建 Season 1 这类目录。"""
         season = int(season or 1)
         try:
             items = cd2.list_dir(dest_show_path, force_refresh=True)
@@ -9691,7 +12868,7 @@ function startPolling() {
 
                 if root_has_season_dir:
                     # 已有规范季目录时，不把剧根目录的误放文件当成已入库集数。
-                    # 这样历史上复制错位置的文件不会阻止后续补到 Season 01。
+                    # 这样历史上复制错位置的文件不会阻止后续补到 Season 1。
                     continue
                 ext = os.path.splitext(item.get("name", ""))[1].lower()
                 if ext not in self._video_extensions:
@@ -9939,7 +13116,22 @@ function startPolling() {
                 else:
                     target_show_path = str(PurePosixPath(dest_path) / show_name)
                     show_state["dest_show_path"] = target_show_path
-                    for file_item in src_video_files:
+                    movie_file_paths = []
+                    for file_item in src_files_all:
+                        if file_item.get("is_dir"):
+                            continue
+                        ext = os.path.splitext(file_item.get("name", ""))[1].lower()
+                        if ext in self._ARCHIVE_EXTENSIONS:
+                            logger.info(
+                                f"【CD2巡查】{show_name!r} 跳过压缩包/镜像文件: "
+                                f"{file_item.get('name', '')}"
+                            )
+                            continue
+                        if ext not in self._video_extensions and ext not in self._COMPANION_EXTENSIONS:
+                            continue
+                        movie_file_paths.append(file_item["path"])
+                        if ext not in self._video_extensions:
+                            continue
                         src_file_path = PurePosixPath(file_item["path"])
                         try:
                             rel_path = src_file_path.relative_to(PurePosixPath(show_path))
@@ -9951,8 +13143,20 @@ function startPolling() {
                             "size": int(file_item.get("size", 0) or 0),
                             "episode": None,
                         })
-                    missing_by_dest = {dest_path: [show_path]}
-                    logger.info(f"【CD2巡查】{show_name!r} 目标无对应目录，整体复制电影目录")
+                    if not movie_file_paths:
+                        self._update_cd2_watch_completion_state(index, rule_state, show_state)
+                        logger.info(f"【CD2巡查】{show_name!r} 没有可复制的电影媒体文件，跳过")
+                        continue
+                    if cd2.create_folder(dest_path, show_name):
+                        logger.info(f"【CD2巡查】{show_name!r} 目标无对应目录，已创建电影目录")
+                    else:
+                        logger.warning(f"【CD2巡查】{show_name!r} 创建电影目录失败，跳过复制")
+                        continue
+                    missing_by_dest = {target_show_path: movie_file_paths}
+                    logger.info(
+                        f"【CD2巡查】{show_name!r} 目标无对应目录，"
+                        f"只复制视频和伴随文件共 {len(movie_file_paths)} 项"
+                    )
 
                 show_notice_records = self._build_cd2_watch_notice_records(
                     rule_id=rule_id,
@@ -10223,10 +13427,8 @@ function startPolling() {
                 if pending_notice_records:
                     completed_at = datetime.now().isoformat()
                     for record in pending_notice_records:
-                        target_path = str(record.get("target_path") or "")
-                        season = record.get("season") or 0
                         record["copy_completed_at"] = completed_at
-                        record["key"] = f"{record.get('rule_name')}|{target_path}|{season}|{completed_at}"
+                        record["key"] = self._cd2_watch_notice_stable_key(record)
                     self._append_cd2_watch_pending_notices(pending_notice_records)
                     refreshed_servers = self._refresh_cd2_watch_mediaservers(pending_notice_records)
                     self._start_cd2_watch_notice_background(
@@ -10235,15 +13437,15 @@ function startPolling() {
                         rounds=3,
                         sleep_seconds=60,
                     )
-                if self._notify:
-                    notify_text = f"本次共同步 {total} 个文件"
-                    if refreshed_servers:
-                        notify_text += f"\n已请求局部刷新媒体库: {', '.join(refreshed_servers)}"
-                    self.post_message(
-                        NotificationType.Plugin,
-                        "CD2 巡查同步完成",
-                        notify_text,
-                    )
+                refresh_text = (
+                    f"，已请求局部刷新媒体库: {', '.join(refreshed_servers)}"
+                    if refreshed_servers
+                    else ""
+                )
+                logger.info(
+                    f"【CD2巡查】同步完成，共 {total} 个文件{refresh_text}；"
+                    "不再单独推送操作通知，入库结果由聚合通知发送"
+                )
             else:
                 logger.warning("【CD2巡查】部分复制任务超时或失败")
         else:

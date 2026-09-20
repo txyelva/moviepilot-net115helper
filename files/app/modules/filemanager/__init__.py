@@ -7,6 +7,7 @@ from app.core.config import settings
 from app.core.context import MediaInfo
 from app.core.meta import MetaBase
 from app.core.metainfo import MetaInfo
+from app.db.mediaserver_oper import MediaServerOper
 from app.helper.directory import DirectoryHelper
 from app.helper.message import MessageHelper
 from app.helper.module import ModuleHelper
@@ -167,6 +168,86 @@ class FileManagerModule(_ModuleBase):
         if cls._media_files_cache:
             cls._media_files_cache.clear()
             logger.debug("115 媒体库文件缓存已清空")
+
+    @staticmethod
+    def __safe_int(value) -> Optional[int]:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def __mediaserver_seasoninfo(cls, seasoninfo) -> Dict[int, list]:
+        """
+        将 Plex/Emby 同步索引中的 seasoninfo 规范化为 {season: [episodes]}。
+        """
+        if not isinstance(seasoninfo, dict):
+            return {}
+
+        seasons: Dict[int, list] = {}
+        for season_key, episodes in seasoninfo.items():
+            season_index = cls.__safe_int(season_key)
+            if season_index is None:
+                continue
+            episode_numbers = []
+            for episode in episodes or []:
+                episode_index = cls.__safe_int(episode)
+                if episode_index is not None and episode_index not in episode_numbers:
+                    episode_numbers.append(episode_index)
+            if episode_numbers:
+                seasons[season_index] = sorted(episode_numbers)
+        return seasons
+
+    def __mediaserver_exists(self, mediainfo: MediaInfo) -> Optional[ExistMediaInfo]:
+        """
+        优先使用 MP 已同步的 Plex/Emby 媒体索引判断是否入库，避免自动任务读取 115 正式库目录。
+        """
+        if not mediainfo or not mediainfo.type:
+            return None
+
+        try:
+            mediaserver = MediaServerOper()
+            item = None
+            if mediainfo.tmdb_id:
+                item = mediaserver.exists(
+                    tmdbid=mediainfo.tmdb_id,
+                    mtype=mediainfo.type.value
+                )
+            if not item and mediainfo.title:
+                item = mediaserver.exists(
+                    title=mediainfo.title,
+                    mtype=mediainfo.type.value,
+                    year=mediainfo.year
+                )
+        except Exception as e:
+            logger.debug(f"查询媒体服务器索引失败：{str(e)}")
+            return None
+
+        if not item:
+            return None
+
+        if mediainfo.type == MediaType.MOVIE:
+            logger.info(f"{mediainfo.title_year} 在媒体服务器索引中找到了")
+            return ExistMediaInfo(
+                type=MediaType.MOVIE,
+                server_type=item.server,
+                server=item.server,
+                itemid=item.item_id
+            )
+
+        seasons = self.__mediaserver_seasoninfo(item.seasoninfo)
+        if not seasons:
+            logger.debug(f"{mediainfo.title_year} 在媒体服务器索引中存在条目，但没有季集信息")
+            return None
+
+        logger.info(f"{mediainfo.title_year} 在媒体服务器索引中找到了这些季集：{seasons}")
+        return ExistMediaInfo(
+            type=MediaType.TV,
+            seasons=seasons,
+            server_type=item.server,
+            server=item.server,
+            itemid=item.item_id
+        )
 
     def init_setting(self) -> Tuple[str, Union[str, bool]]:
         pass
@@ -595,7 +676,8 @@ class FileManagerModule(_ModuleBase):
             self.__clear_media_files_cache(target_storage)
         return ret
 
-    def media_files(self, mediainfo: MediaInfo, force_refresh: Optional[bool] = False) -> List[FileItem]:
+    def media_files(self, mediainfo: MediaInfo, force_refresh: Optional[bool] = False,
+                    skip_cache_storage: Optional[bool] = False) -> List[FileItem]:
         """
         获取对应媒体的媒体库文件列表
         :param mediainfo: 媒体信息
@@ -606,6 +688,9 @@ class FileManagerModule(_ModuleBase):
         dest_dirs = DirectoryHelper().get_library_dirs()
         # 检查每一个媒体库目录
         for dest_dir in dest_dirs:
+            if skip_cache_storage and self.__is_media_files_cache_storage(dest_dir.library_storage):
+                logger.debug(f"跳过 115 媒体库文件系统存在性兜底：{mediainfo.title_year}")
+                continue
             # 存储
             storage_oper = self.__get_storage_oper(dest_dir.library_storage)
             if not storage_oper:
@@ -679,12 +764,19 @@ class FileManagerModule(_ModuleBase):
         if not settings.LOCAL_EXISTS_SEARCH:
             return None
 
-        logger.debug(f"正在本地媒体库中查找 {mediainfo.title_year}...")
+        force_refresh = kwargs.get("force_refresh") or kwargs.get("refresh")
+
+        mediaserver_exists = self.__mediaserver_exists(mediainfo)
+        if mediaserver_exists:
+            return mediaserver_exists
+
+        logger.debug(f"正在本地媒体库文件系统中查找 {mediainfo.title_year}...")
 
         # 检查媒体库
         fileitems = self.media_files(
             mediainfo,
-            force_refresh=kwargs.get("force_refresh") or kwargs.get("refresh")
+            force_refresh=force_refresh,
+            skip_cache_storage=not force_refresh
         )
         if not fileitems:
             logger.debug(f"{mediainfo.title_year} 不在本地媒体库中")

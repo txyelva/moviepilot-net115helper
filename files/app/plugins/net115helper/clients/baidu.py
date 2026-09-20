@@ -28,10 +28,29 @@ BAIDU_APP_ID = "250528"
 
 class BaiduClient:
     _cookie: str = ""
+    # 百度对文件管理接口触发人机验证后的冷却（重试无法绕过，只能等或人工验证）
+    _DELETE_BLOCK_SECONDS: int = 24 * 3600
+    _delete_blocked_until: float = 0.0
+    # 本次 save_shared_link 是否因「分享已取消/已失效」而失败，供上层拉黑死链
+    last_share_dead: bool = False
 
     @classmethod
     def set_cookie(cls, cookie: str) -> None:
         cls._cookie = str(cookie or "").strip()
+
+    @staticmethod
+    def _is_verify_challenge(data: dict) -> bool:
+        """百度要求人机/安全验证：errno 132，或响应里带 verify_scene / authwidget。"""
+        if not isinstance(data, dict):
+            return False
+        if str(data.get("errno")) == "132":
+            return True
+        # 只要响应里出现这两个字段就说明百度要求走验证流程（值可能为空结构）
+        return "verify_scene" in data or "authwidget" in data
+
+    @classmethod
+    def _delete_is_blocked(cls) -> bool:
+        return time.time() < cls._delete_blocked_until
 
     @classmethod
     def _read_cookie(cls) -> str:
@@ -78,6 +97,7 @@ class BaiduClient:
 
     @classmethod
     def save_shared_link(cls, share_url: str, share_pwd: str, target_folder_path: str) -> bool:
+        cls.last_share_dead = False
         cookie = cls._read_cookie()
         if not cookie:
             logger.warning("【BaiduClient】未配置百度网盘 Cookie")
@@ -86,6 +106,13 @@ class BaiduClient:
         if not surl:
             logger.warning(f"【BaiduClient】无法解析分享链接: {share_url}")
             return False
+
+        # PanSou 常把提取码直接拼在链接的 ?pwd= 上而不单独给 password 字段。
+        # 没有提取码就不会走 /share/verify、拿不到 BDCLND，加密分享恒 fsids=0。
+        if not share_pwd:
+            share_pwd = cls._extract_pwd_from_url(share_url)
+            if share_pwd:
+                logger.debug(f"【BaiduClient】从链接参数取得提取码: {share_pwd}")
 
         try:
             with cls._client(cookie) as client:
@@ -97,12 +124,17 @@ class BaiduClient:
                 verified_sekey = ""
                 if share_pwd:
                     verified_sekey = cls._verify_share(client, surl, share_pwd, bdstoken)
+                    # 加密分享后续所有取内容的请求都要带 BDCLND，否则恒返回 errno -9
+                    if verified_sekey:
+                        client.cookies.set("BDCLND", quote(verified_sekey), domain=".baidu.com")
 
                 share_data = cls._get_share_data(client, share_url, surl, share_pwd)
                 shareid = str(share_data.get("shareid") or "")
                 uk = str(share_data.get("uk") or share_data.get("share_uk") or "")
                 sekey = share_data.get("sekey") or share_data.get("randsk") or verified_sekey or ""
-                fsids = share_data.get("fsids") or cls._get_root_fsids(client, uk, shareid)
+                fsids = share_data.get("fsids") or cls._get_root_fsids(
+                    client, uk, shareid, share_url=share_url, sekey=sekey
+                )
 
                 if not shareid or not uk or not fsids:
                     logger.warning(
@@ -182,6 +214,21 @@ class BaiduClient:
             "origin": "https://pan.baidu.com",
         }
         return httpx.Client(headers=headers, timeout=30.0, follow_redirects=True)
+
+    @staticmethod
+    def _extract_pwd_from_url(url: str) -> str:
+        """从分享链接的 ?pwd=/&pwd= 参数取提取码（含末尾多余引号等噪声时也能取到）。"""
+        try:
+            qs = parse_qs(urlparse(url or "").query)
+            for key in ("pwd", "passcode", "code"):
+                if qs.get(key):
+                    val = str(qs[key][0]).strip().strip("'\"")
+                    if val:
+                        return val
+        except Exception:
+            pass
+        m = re.search(r"[?&]pwd=([A-Za-z0-9]{4})", url or "")
+        return m.group(1) if m else ""
 
     @staticmethod
     def _parse_surl(url: str) -> str:
@@ -288,8 +335,52 @@ class BaiduClient:
                     pass
         return data
 
+    @staticmethod
+    def _extract_file_list_from_page(text: str) -> list:
+        """
+        从分享页 HTML 里解析 file_list。
+
+        百度已对加密分享关闭 /share/list（恒返回 errno -9「提取码验证失败」），
+        文件列表改为直接嵌在分享页的 `"file_list":[...]` 中，需先带上 BDCLND。
+        """
+        m = re.search(r'"file_list"\s*:\s*(\[.*?\])\s*[,}]', text or "", re.S)
+        if not m:
+            return []
+        raw = m.group(1)
+        for loader in (
+            lambda s: json.loads(s),
+            lambda s: json.loads(s.encode().decode("unicode_escape")),
+        ):
+            try:
+                items = loader(raw)
+                if isinstance(items, list):
+                    return items
+            except Exception:
+                continue
+        # 结构再变时的兜底：至少把 fs_id 抠出来
+        return [{"fs_id": int(x)} for x in re.findall(r'"fs_id"\s*:\s*"?(\d+)"?', raw)]
+
     @classmethod
-    def _get_root_fsids(cls, client: httpx.Client, uk: str, shareid: str) -> list:
+    def _get_root_fsids(cls, client: httpx.Client, uk: str, shareid: str,
+                        share_url: str = "", sekey: str = "") -> list:
+        """取分享根目录的 fsid 列表：优先解析分享页，失败再退回旧接口。"""
+        if share_url:
+            try:
+                if sekey:
+                    client.cookies.set("BDCLND", quote(sekey), domain=".baidu.com")
+                resp = client.get(share_url, headers={"referer": "https://pan.baidu.com/"})
+                items = cls._extract_file_list_from_page(resp.text)
+                fsids = [
+                    int(item.get("fs_id") or item.get("fsid"))
+                    for item in items
+                    if item.get("fs_id") or item.get("fsid")
+                ]
+                if fsids:
+                    return fsids
+                logger.debug("【BaiduClient】分享页未解析到 file_list，回退 share/list")
+            except Exception as e:
+                logger.debug(f"【BaiduClient】解析分享页 file_list 失败: {e}")
+
         params = {
             "uk": uk,
             "shareid": shareid,
@@ -304,6 +395,13 @@ class BaiduClient:
         }
         resp = client.get("https://pan.baidu.com/share/list", params=params)
         data = resp.json()
+        if cls._is_dead_share(data):
+            cls.last_share_dead = True
+            logger.info(
+                f"【BaiduClient】分享已失效(errno={data.get('errno')}): "
+                f"{data.get('show_msg') or ''}"
+            )
+            return []
         items = data.get("list") or (data.get("data") or {}).get("list") or []
         fsids = []
         for item in items:
@@ -311,6 +409,16 @@ class BaiduClient:
             if fsid:
                 fsids.append(int(fsid))
         return fsids
+
+    @staticmethod
+    def _is_dead_share(data: dict) -> bool:
+        """百度：errno -21 分享已被取消 / -22 等同类终态。"""
+        if not isinstance(data, dict):
+            return False
+        if str(data.get("errno")) in ("-21", "-22"):
+            return True
+        msg = str(data.get("show_msg") or data.get("errmsg") or "")
+        return any(k in msg for k in ("已被取消", "已失效", "已删除", "不存在"))
 
     @classmethod
     def _ensure_folder(cls, client: httpx.Client, bdstoken: str, folder_path: str) -> bool:
@@ -406,6 +514,10 @@ class BaiduClient:
         folder_path = cls._normalize_path(folder_path)
         if folder_path == "/":
             return False
+        if cls._delete_is_blocked():
+            # 冷却期内直接放弃删除：残留的是空目录，不影响后续保存
+            logger.debug(f"【BaiduClient】删除处于安全验证冷却期，跳过: {folder_path}")
+            return False
         item = cls._find_path(client, folder_path, bdstoken)
         if not item:
             return True
@@ -430,6 +542,23 @@ class BaiduClient:
         except Exception:
             data = {}
         if data.get("errno") in (0, "0"):
+            cls._delete_blocked_until = 0.0
             return True
+        if cls._is_verify_challenge(data):
+            # 百度对 filemanager 触发了人机/安全验证（errno 132 + verify_scene）。
+            # 这种拦截靠重试无法绕过，继续撞只会每天刷上千次无效请求，
+            # 因此进入长冷却，冷却期内不再尝试删除，并且只告警一次。
+            first = cls._delete_blocked_until <= time.time()
+            cls._delete_blocked_until = time.time() + cls._DELETE_BLOCK_SECONDS
+            if first:
+                logger.warning(
+                    f"【BaiduClient】删除被百度安全验证拦截(errno={data.get('errno')})，"
+                    f"暂停删除 {cls._DELETE_BLOCK_SECONDS // 3600} 小时；"
+                    "需到百度网盘网页端完成一次验证后才能恢复。"
+                    "临时目录清理将由后续保存流程跳过，不影响转存。"
+                )
+            else:
+                logger.debug(f"【BaiduClient】删除仍被安全验证拦截 {folder_path}: {data}")
+            return False
         logger.warning(f"【BaiduClient】删除路径失败 {folder_path}: {data}")
         return False

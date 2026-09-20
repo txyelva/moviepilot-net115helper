@@ -1,6 +1,9 @@
 # MoviePilot 本体覆盖改动记录
 
-更新时间：2026-06-15
+更新时间：2026-09-20
+
+> 2026-09-20 同步说明：本次把容器内实际运行的覆盖文件整体同步回仓库，对应 MoviePilot **v2.12.3**。
+> 因此本文件记录的“保留点”应理解为 v2.12.3 基线上的当前状态，而不是 6 月快照。
 
 本文只记录 MoviePilot 本体覆盖文件，不记录 `net115helper` 插件自身逻辑。目的：以后升级 MoviePilot、重建容器或同步代码时，如果本体文件被上游覆盖，可以快速知道哪些行为需要重新合并。
 
@@ -116,6 +119,39 @@
 - 个别剧集有成功 `transferhistory`，但没有对应 `message` 记录；这些记录走的是 115 插件触发的实时手动整理路径，才需要插件侧补偿发 `NotificationType.Organize`。
 - 以前部分 115 订阅入库有 TG 通知，是因为 MP 的远程目录监控 `monitor.py` 先发现待刮削目录里的新文件并加入整理队列；这条 MP 队列整理会走 `message.py` 发“整理入库”。
 - 同一时间插件的待入库整理也可能调用 `manual_transfer(..., background=False)`，但如果 MP 监控已经先入队/整理，通知来自 MP 监控队列；如果插件手动整理先完成并移动了文件，MP 监控就不再能发现原文件，因此原生通知不会出现。
+
+## 2026-09-20：v2.12.3 升级后的实测偏移
+
+同步时对比容器内文件与 6 月快照，发现以下变化，均已按容器实际状态写回仓库：
+
+### `app/core/config.py`：4 个自定义配置项在升级中丢失
+
+v2.12.3 的 `config.py` 里已不存在下列声明（6 月快照中有）：
+
+- `PANSOU_URL`、`PANSOU_AUTH_USER`、`PANSOU_AUTH_PASS`
+- `U115_COOKIES`、`DEFAULT_115_CID`
+
+`DOH_DOMAINS`、`PLUGIN_MARKET`、`SECURITY_IMAGE_DOMAINS` 仍在。
+
+影响评估：
+
+- **`net115helper` 不受影响**。它的读取顺序是「插件配置 → `getattr(settings, ...)` → 环境变量」，实际值来自插件配置页，settings 只是兜底。
+- 仍引用这些 settings 的是 `pansousubscribe`（已被 net115helper 取代的旧插件）与
+  `app/agent/tools/impl/{search_pansou,save_115_share}.py`。如果以后要重新启用它们，
+  需要在插件配置、环境变量或重新补回 `config.py` 声明中任选一种方式提供取值。
+
+结论：当前不需要回补。若后续发现旧插件或 agent 工具取不到值，再按上面三种方式之一补。
+
+### `app/modules/themoviedb/__init__.py`、`app/chain/download.py`、`app/modules/filemanager/__init__.py`
+
+相对 6 月快照分别有 422 / 89 / 98 行差异，主要来自上游 v2.12.3 变更与我们补丁的重新合并结果。
+原有保留点（剧集组、缺失集三层补全、115 存在性检查限深）在当前容器版本中仍然存在。
+
+### 插件侧脱敏（非本体）
+
+`net115helper` 原先把 CD2 的 115 本地挂载根目录写死为具体部署路径，本次改为
+配置项 `cd2_local_mount_115`（留空则按 `/volume*/CloudDrive/...` 等通用约定自动探测）。
+已在容器内实测：自动探测结果与原硬编码路径一致，行为不变。
 
 ## 升级/回退后核对清单
 
