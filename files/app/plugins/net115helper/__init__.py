@@ -6604,12 +6604,29 @@ function startPolling() {
         sub["_cache_updated"] = datetime.now().isoformat()
         target_missing_episodes = []
         if media_type_str != "电影" and total_eps:
+            # 缺失集数按「TMDB 已播出集数」封顶，而不是按整季总集数。
+            # 否则会去找根本没播的集，一旦命中错剧资源（聚合帖/裸数字文件），
+            # 就会把别的剧当成本剧后续集入库。
+            fetch_ceiling = self._airing_effective_target(sub, total_eps)
+            if fetch_ceiling is None:
+                fetch_ceiling = total_eps
             target_missing_episodes = sorted(
-                set(range(1, total_eps + 1)) - set(effective_existing_episodes)
+                set(range(1, int(fetch_ceiling) + 1)) - set(effective_existing_episodes)
             )
-            logger.info(
-                f"【115助手】{title} 当前缺失集数: {target_missing_episodes}"
-            )
+            if fetch_ceiling < total_eps:
+                logger.info(
+                    f"【115助手】{title} 当前缺失集数: {target_missing_episodes} "
+                    f"(按已播出 {fetch_ceiling}/{total_eps} 集封顶)"
+                )
+            else:
+                logger.info(
+                    f"【115助手】{title} 当前缺失集数: {target_missing_episodes}"
+                )
+            if not target_missing_episodes and not pending_episodes:
+                logger.info(
+                    f"【115助手】{title} 已追平已播出进度，本轮不搜索/降级"
+                )
+                return
             if pending_episodes and not target_missing_episodes:
                 logger.info(
                     f"【115助手】{title} 已由入库+待入库覆盖全集，"
@@ -9071,6 +9088,63 @@ function startPolling() {
         return True
 
     @classmethod
+    def _aggregated_post_link_mismatch(cls, result: dict, subscription: dict) -> bool:
+        """
+        聚合帖错剧防护。
+
+        频道聚合帖会在一条结果里列多部剧、每部各带一组网盘链接，例如
+        「#仙逆 … 链接组 / 电视剧：一瓯春 … 链接组 / 电视剧：兰香如故 … 链接组」。
+        这种结果只要本剧名出现在帖子任意位置，标题匹配就会通过，但 PanSou 给出的
+        url 可能属于帖子里另一部剧——直接转存就会把别的剧当作本剧后续集入库
+        （2026-09-21 一瓯春 E11-E22 实际是兰香如故的片源）。
+
+        返回 True 表示「这是聚合帖，且 url 不属于本剧那一段」，应当丢弃该结果。
+        """
+        url = str(result.get("url") or "").strip()
+        text = " ".join(
+            str(result.get(key, "") or "")
+            for key in ("note", "name", "title")
+        )
+        if not url or not text:
+            return False
+
+        # 条目分隔标记：`电视剧：`、`综艺:`、`#剧名` 等
+        markers = [m.start() for m in re.finditer(
+            r"(?:电视剧|电影|综艺|动漫|动画|纪录片|短剧)\s*[:：]|#", text)]
+        if len(markers) < 2:
+            return False  # 不是聚合帖，交给其它校验
+
+        bounds = sorted(set(markers + [0, len(text)]))
+        segments = [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]
+
+        url_seg = None
+        pos = text.find(url)
+        if pos < 0:
+            # PanSou 可能对 url 做过清洗，退化为用分享 ID 定位
+            m = re.search(r"/s/([A-Za-z0-9_-]{6,})", url)
+            if m:
+                pos = text.find(m.group(1))
+        if pos < 0:
+            return False
+        for s, e in segments:
+            if s <= pos < e:
+                url_seg = (s, e)
+                break
+        if not url_seg:
+            return False
+
+        # url 所在段里必须能匹配到本剧标题
+        seg_text = re.sub(r"\s+", "", text[url_seg[0]:url_seg[1]])
+        if cls._subscription_title_match_state(seg_text, subscription) is True:
+            return False
+
+        logger.info(
+            f"【115助手】聚合帖结果的链接不属于 {subscription.get('title')} 所在条目，丢弃: "
+            f"seg={seg_text[:48]}"
+        )
+        return True
+
+    @classmethod
     def _result_definitely_off_topic(cls, result: dict, subscription: dict) -> bool:
         """过滤标题党、在线观影页、课程等明显不是目标剧资源的搜索结果。"""
         title = str(subscription.get("title") or "").strip()
@@ -9084,6 +9158,9 @@ function startPolling() {
         compact = re.sub(r"\s+", "", text)
         title_match_state = cls._subscription_title_match_state(compact, subscription)
         if title_match_state is None or title_match_state is False:
+            return True
+
+        if cls._aggregated_post_link_mismatch(result, subscription):
             return True
 
         # 这些通常是在线播放/课程营销页，不是可转存的网盘剧集文件。
@@ -9344,6 +9421,8 @@ function startPolling() {
             str(result.get(key, "") or "")
             for key in ("note", "name", "title")
         )
+        if self._aggregated_post_link_mismatch(result, subscription):
+            return False
         title_match_state = self._subscription_title_match_state(text, subscription)
         if title_match_state is False or title_match_state is None:
             logger.info(
