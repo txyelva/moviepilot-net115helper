@@ -293,6 +293,21 @@ class CD2Client:
             for t in result.copyTasks:
                 # TaskStatus: Pending=0, Scanning=1, Scanned=2, Completed=3, Failed=4
                 status_name = clouddrive_pb2.CopyTask.TaskStatus.Name(t.status)
+                start_time = 0.0
+                end_time = 0.0
+                try:
+                    if t.HasField("startTime"):
+                        start_time = (
+                            float(t.startTime.seconds)
+                            + float(t.startTime.nanos) / 1_000_000_000
+                        )
+                    if t.HasField("endTime"):
+                        end_time = (
+                            float(t.endTime.seconds)
+                            + float(t.endTime.nanos) / 1_000_000_000
+                        )
+                except (AttributeError, ValueError):
+                    pass
                 tasks.append(
                     {
                         "source_path": t.sourcePath,
@@ -304,6 +319,8 @@ class CD2Client:
                         "failed_files": t.failedFiles,
                         "paused": t.paused,
                         "errors": list(t.errors),
+                        "start_time": start_time,
+                        "end_time": end_time,
                     }
                 )
             return tasks
@@ -311,21 +328,78 @@ class CD2Client:
             logger.error(f"【CD2Client】get_copy_tasks 异常: {e}")
             return []
 
-    def wait_for_copy(self, timeout: int = 300, poll_interval: int = 5) -> bool:
+    def wait_for_copy(
+        self,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        source_paths: Optional[List[str]] = None,
+        dest_path: str = "",
+        started_after: Optional[float] = None,
+    ) -> bool:
         """
-        轮询等待所有复制任务完成。
+        轮询等待复制任务完成。
+
+        传入 source_paths / dest_path 时，只等待本次提交的目标任务，避免被
+        CloudDrive2 中其他长期 Scanned/Pending 任务拖成超时。未传时保留原有
+        的“等待全部任务”行为，兼容现有调用。
 
         :param timeout:       最长等待秒数（默认 300 秒）
         :param poll_interval: 每次轮询间隔秒数（默认 5 秒）
         :return: 所有任务成功完成返回 True；超时或有失败任务返回 False
         """
         deadline = time.time() + timeout
+        expected_sources = {
+            str(path or "").rstrip("/")
+            for path in (source_paths or [])
+            if str(path or "").strip()
+        }
+        expected_dest = str(dest_path or "").rstrip("/")
+        scoped = bool(expected_sources or expected_dest)
+        start_floor = float(started_after or 0) - 10.0
         while time.time() < deadline:
             tasks = self.get_copy_tasks()
-            if not tasks:
+            if not tasks and not scoped:
                 # 任务列表为空，可能已全部完成并被清理
                 logger.info("【CD2Client】复制任务列表为空，视为完成")
                 return True
+
+            if scoped:
+                matching = []
+                for task in tasks:
+                    source = str(task.get("source_path") or "").rstrip("/")
+                    dest = str(task.get("dest_path") or "").rstrip("/")
+                    if expected_sources and source not in expected_sources:
+                        continue
+                    if expected_dest and dest != expected_dest:
+                        continue
+                    task_start = float(task.get("start_time") or 0)
+                    if start_floor and task_start and task_start < start_floor:
+                        continue
+                    matching.append(task)
+
+                if expected_sources:
+                    latest_by_source = {}
+                    for task in matching:
+                        source = str(task.get("source_path") or "").rstrip("/")
+                        previous = latest_by_source.get(source)
+                        if previous is None or float(task.get("start_time") or 0) >= float(
+                            previous.get("start_time") or 0
+                        ):
+                            latest_by_source[source] = task
+                    if set(latest_by_source) != expected_sources:
+                        logger.debug(
+                            "【CD2Client】等待本次复制任务出现: "
+                            f"已发现={len(latest_by_source)}/{len(expected_sources)}"
+                        )
+                        time.sleep(poll_interval)
+                        continue
+                    tasks = list(latest_by_source.values())
+                else:
+                    tasks = matching
+                    if not tasks:
+                        logger.debug("【CD2Client】等待目标复制任务出现")
+                        time.sleep(poll_interval)
+                        continue
 
             # 分析任务状态
             # Completed=3, Failed=4

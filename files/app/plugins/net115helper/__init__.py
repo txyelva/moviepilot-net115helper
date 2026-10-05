@@ -6622,20 +6622,8 @@ function startPolling() {
                 logger.info(
                     f"【115助手】{title} 当前缺失集数: {target_missing_episodes}"
                 )
-            if not target_missing_episodes and not pending_episodes:
-                logger.info(
-                    f"【115助手】{title} 已追平已播出进度，本轮不搜索/降级"
-                )
-                return
-            if pending_episodes and not target_missing_episodes:
-                logger.info(
-                    f"【115助手】{title} 已由入库+待入库覆盖全集，"
-                    "跳过搜索/降级，等待待入库整理确认"
-                )
-                return
-
-        # 已经确认全集入库/待入库时，先归档，再进入搜索分支。
-        # 否则「未搜到115资源 → 降级转存 → return」会绕过末尾的自动完结检测。
+        # 已经确认全集入库时，必须在「追平已播出进度」判断前归档。
+        # 否则全集的缺失集为空，会提前 return，既不归档也进不到兜底探针。
         if media_type_str == "电影":
             if -1 in real_existing_set:
                 logger.info(f"【115助手】电影 {title} 已入库，标记自动取消订阅")
@@ -6658,6 +6646,13 @@ function startPolling() {
             sub["auto_completed"] = True
             sub["completed_time"] = datetime.now().isoformat()
             sub["completed_reason"] = f"全集入库 ({len(real_existing_set)}/{total_eps})"
+            return
+
+        if pending_episodes and not target_missing_episodes:
+            logger.info(
+                f"【115助手】{title} 已由入库+待入库覆盖当前追更目标，"
+                "跳过搜索/降级，等待待入库整理确认"
+            )
             return
 
         # 追平已播出进度就不再空搜：TMDB 总集数含未播出的集，按它算缺失会让插件
@@ -11187,6 +11182,7 @@ function startPolling() {
                             return None
                         return _box[0]
 
+                    _copy_started_at = time.time()
                     copy_ok = _cd2_copy_with_timeout(src_paths, copy_target)
                     if copy_ok is None:
                         _timeout_ep_nums = []
@@ -11258,9 +11254,17 @@ function startPolling() {
                         _movie=_is_movie,
                         _season=_season,
                         _note=_result_note,
+                        _src_paths=list(src_paths),
+                        _copy_target=copy_target,
+                        _started_after=_copy_started_at,
                     ):
                         try:
-                            _ok = _cd2.wait_for_copy(timeout=900)
+                            _ok = _cd2.wait_for_copy(
+                                timeout=900,
+                                source_paths=_src_paths,
+                                dest_path=_copy_target,
+                                started_after=_started_after,
+                            )
                             _sys.stdout.write(f"【降级/BG】wait_for_copy 结果: {_ok} ({_title})\n")
                             _sys.stdout.flush()
                             if _ok:
